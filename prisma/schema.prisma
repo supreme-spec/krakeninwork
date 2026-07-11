@@ -1,0 +1,164 @@
+// This is your Prisma schema file
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Camera {
+  id                   Int       @id @default(autoincrement())
+  name                 String
+  source               String
+  camera_type          String    @default("USB") // USB, ONVIF, RTSP, Hikvision, UNV
+  zone                 String?
+  is_active            Boolean   @default(true)
+  created_at           DateTime  @default(now())
+  status               String    @default("offline")
+  roi_zones            String?   // JSON string
+  fps                  Int       @default(25)
+  ping_ms              Int       @default(0)
+  is_smart_recording   Boolean   @default(false)
+  is_chronicle         Boolean   @default(true)
+  driver_type          String?
+  ip_address           String?
+  ip_port              Int?
+  username             String?
+  password             String?
+  use_camera_analytics Boolean   @default(false)
+  
+  events               Event[]
+  recordings           Recording[]
+}
+
+model Category {
+  id             Int       @id @default(autoincrement())
+  code           String    @unique
+  label          String
+  color          String
+  bg_color       String
+  is_alert       Boolean   @default(false)
+  alert_sound    String    @default("off")
+  alert_volume   Float     @default(0.5)
+  detect_enabled Boolean   @default(true)
+  sort_order     Int       @default(100)
+  is_system      Boolean   @default(false)
+}
+
+model Person {
+  id              Int               @id @default(autoincrement())
+  name            String
+  category        String
+  position        String?
+  comment         String?
+  phone           String?
+  email           String?
+  birth_date      String?
+  address         String?
+  organization    String?
+  extra_info      String?
+  photo_path      String?
+  is_active       Boolean           @default(true)
+  created_at      DateTime          @default(now())
+  last_seen_at    DateTime?
+  visit_count     Int               @default(0)
+  embedding_count Int               @default(0)
+  
+  photos          PersonPhoto[]
+  events          Event[]
+  incidents       Incident[]
+  tags            Tag[]
+  descriptors     FaceDescriptor[]
+}
+
+model FaceDescriptor {
+  id          Int       @id @default(autoincrement())
+  person_id   Int
+  photo_path  String
+  descriptor  String    // JSON array of floats
+  created_at  DateTime  @default(now())
+  
+  person      Person    @relation(fields: [person_id], references: [id], onDelete: Cascade)
+  
+  @@index([person_id])
+}
+
+model PersonPhoto {
+  id            Int      @id @default(autoincrement())
+  person_id     Int
+  photo_path    String
+  is_primary    Boolean  @default(false)
+  has_embedding Boolean  @default(false)
+  created_at    DateTime @default(now())
+  
+  person        Person   @relation(fields: [person_id], references: [id], onDelete: Cascade)
+}
+
+model Event {
+  id                          Int       @id @default(autoincrement())
+  camera_id                   Int
+  camera_name                 String
+  person_id                   Int?
+  event_type                  String
+  confidence                  Float
+  snapshot_path               String?
+  person_name                 String?
+  person_category             String?
+  person_photo_path           String?
+  created_at                  DateTime  @default(now())
+  needs_operator_confirmation Boolean   @default(false)
+  confirmation_status         String?
+  
+  camera                      Camera    @relation(fields: [camera_id], references: [id], onDelete: Cascade)
+  person                      Person?   @relation(fields: [person_id], references: [id], onDelete: SetNull)
+}
+
+model Recording {
+  id          Int      @id @default(autoincrement())
+  camera_id   Int
+  camera_name String
+  start_time  DateTime
+  end_time    DateTime
+  duration    Int
+  size_mb     Float
+  video_path  String
+  is_favorite Boolean  @default(false)
+  
+  camera      Camera   @relation(fields: [camera_id], references: [id], onDelete: Cascade)
+}
+
+model Incident {
+  id            Int      @id @default(autoincrement())
+  person_id     Int
+  incident_type String
+  severity      String
+  comment       String?
+  status        String   @default("open")
+  created_at    DateTime @default(now())
+  
+  person        Person   @relation(fields: [person_id], references: [id], onDelete: Cascade)
+}
+
+model Tag {
+  id        Int    @id @default(autoincrement())
+  person_id Int
+  tag       String
+  
+  person    Person @relation(fields: [person_id], references: [id], onDelete: Cascade)
+}
+
+model Settings {
+  key   String @id
+  value String
+}
+
+model FaissUpdateLog {
+  id          Int      @id @default(autoincrement())
+  timestamp   DateTime @default(now())
+  action      String
+  details     String?
+  status      String
+}

@@ -1,0 +1,22 @@
+/* App-level overrides — most styles are in index.css via Tailwind */
+
+/* ── Свободные блоки LiveMonitor ── */
+
+/* Курсор move на всём блоке */
+.free-block {
+  cursor: move;
+}
+
+/* no-drag — отменяет перетаскивание, возвращает нормальный курсор */
+.no-drag {
+  cursor: default !important;
+}
+.no-drag button,
+.no-drag a {
+  cursor: pointer !important;
+}
+.no-drag input,
+.no-drag select,
+.no-drag textarea {
+  cursor: text !important;
+}

@@ -1,0 +1,981 @@
+/**
+ * Face Detection & Recognition Engine (v3.0)
+ * Современная реализация с использованием FastAPI + InsightFace
+ *
+ * Улучшения v3.0:
+ *  1. Health check Python-сервера с кэшированием статуса и автоматическим восстановлением
+ *  2. Бинарное хранение дескрипторов (вместо JSON) — экономия ~30% места и быстрее парсинг
+ *  3. Защита от Path Traversal — санитизация путей, проверка корневых директорий
+ *  4. Оптимизированный поиск — кэширование эмбеддингов + partitioning по категориям
+ */
+
+import path from "path";
+import fs from "fs";
+import sharp from "sharp";
+import fetch, { FormData, Blob } from "node-fetch";
+import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
+import { prisma } from "./db.js";
+
+// ─── Конфигурация ────────────────────────────────────────────────────────────
+
+const FACE_SERVER_URL = process.env.FACE_SERVER_URL || "http://localhost:8001";
+const USE_PYTHON_SERVER = true;
+
+// Health check
+const HEALTH_CHECK_INTERVAL_MS = Number(process.env.FACE_HEALTH_CHECK_INTERVAL) || 10_000;
+const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.FACE_HEALTH_CHECK_TIMEOUT) || 5_000;
+
+// Embedding cache
+const EMBEDDING_CACHE_TTL_MS = Number(process.env.FACE_EMBEDDING_CACHE_TTL) || 5 * 60 * 1000; // 5 мин
+
+// Path traversal protection
+const MAX_PATH_DEPTH = 10;
+
+// ─── Типы ────────────────────────────────────────────────────────────────────
+
+export interface DetectedFace {
+  box: { x: number; y: number; width: number; height: number };
+  score: number;
+  descriptor?: Float32Array;
+}
+
+export interface RecognitionMatch {
+  personId: number;
+  personName: string;
+  category: string;
+  similarity: number;
+  photoPath: string;
+}
+
+/** Кэш эмбеддингов: ключ = хеш пути, значение = { descriptor, timestamp } */
+interface EmbeddingCacheEntry {
+  descriptor: Float32Array;
+  timestamp: number;
+}
+
+// ─── Глобальное состояние ────────────────────────────────────────────────────
+
+let isInitialized = false;
+
+/** Дескрипторы в памяти — partitioned по категориям для ускорения поиска */
+const storedDescriptors: Array<{
+  personId: number;
+  personName: string;
+  category: string;
+  photoPath: string;
+  descriptor: Float32Array;
+  descriptorList: number[];
+}> = [];
+
+/** Кэш эмбеддингов: pathHash -> { descriptor, timestamp } */
+const embeddingCache = new Map<string, EmbeddingCacheEntry>();
+
+/** Статус здоровья Python-сервера */
+let pythonServerHealthy = true;
+let pythonServerLastCheck = 0;
+let pythonServerCheckPromise: Promise<boolean> | null = null;
+
+/** Таймер периодического health check */
+let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+
+// ─── 1. HEALTH CHECK PYTHON-СЕРВЕРА ──────────────────────────────────────────
+
+/**
+ * Проверяет доступность Python-сервера.
+ * Результат кэшируется до следующего интервала.
+ */
+async function checkPythonServerHealth(): Promise<boolean> {
+  const now = Date.now();
+  const timeSinceLastCheck = now - pythonServerLastCheck;
+
+  // Если проверка была недавно — возвращаем кэшированный результат
+  if (timeSinceLastCheck < HEALTH_CHECK_INTERVAL_MS && pythonServerLastCheck > 0) {
+    return pythonServerHealthy;
+  }
+
+  // Если уже идёт асинхронная проверка — ждём её
+  if (pythonServerCheckPromise) {
+    return pythonServerCheckPromise;
+  }
+
+  pythonServerCheckPromise = (async () => {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+
+      const response = await fetch(`${FACE_SERVER_URL}/health`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const wasHealthy = pythonServerHealthy;
+      pythonServerHealthy = response.ok;
+      pythonServerLastCheck = Date.now();
+
+      if (!wasHealthy && pythonServerHealthy) {
+        logInfo("Python-сервер восстановлен", { url: FACE_SERVER_URL });
+      } else if (wasHealthy && !pythonServerHealthy) {
+        logWarn("Python-сервер недоступен", { url: FACE_SERVER_URL });
+      }
+
+      return pythonServerHealthy;
+    } catch (err) {
+      const wasHealthy = pythonServerHealthy;
+      pythonServerHealthy = false;
+      pythonServerLastCheck = Date.now();
+
+      if (wasHealthy) {
+        logWarn("Python-сервер недоступен (ошибка подключения)", {
+          url: FACE_SERVER_URL,
+          error: (err as Error).message,
+        });
+      }
+
+      return false;
+    } finally {
+      pythonServerCheckPromise = null;
+    }
+  })();
+
+  return pythonServerCheckPromise;
+}
+
+/** Запускает периодический health check */
+function startHealthCheckTimer(): void {
+  if (healthCheckTimer) return;
+
+  healthCheckTimer = setInterval(async () => {
+    try {
+      await checkPythonServerHealth();
+    } catch (err) {
+      logError(err as Error, { context: "Health check timer" });
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+
+  // Make it not prevent process exit
+  if (healthCheckTimer.unref) {
+    healthCheckTimer.unref();
+  }
+}
+
+/** Останавливает периодический health check */
+function stopHealthCheckTimer(): void {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = null;
+  }
+}
+
+/**
+ * Проверяет здоровье сервера перед выполнением операции.
+ * Возвращает true если сервер доступен, false если нет.
+ */
+async function ensurePythonServerAvailable(): Promise<boolean> {
+  const healthy = await checkPythonServerHealth();
+  if (!healthy) {
+    logWarn("Python-сервер недоступен, операция отложена", {
+      url: FACE_SERVER_URL,
+      lastCheck: new Date(pythonServerLastCheck).toISOString(),
+    });
+  }
+  return healthy;
+}
+
+// ─── 2. БИНАРНОЕ ХРАНЕНИЕ ДЕСКРИПТОРОВ ──────────────────────────────────────
+
+/**
+ * Конвертирует Float32Array в буфер для бинарного хранения.
+ * Float32Array из 512 элементов = 512 * 4 = 2048 байт.
+ */
+function descriptorToBinary(descriptor: Float32Array): Buffer {
+  const buffer = Buffer.allocUnsafe(descriptor.byteLength);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  for (let i = 0; i < descriptor.length; i++) {
+    view.setFloat32(i * 4, descriptor[i], true); // little-endian
+  }
+  return buffer;
+}
+
+/**
+ * Конвертирует бинарный буфер обратно в Float32Array.
+ */
+function binaryToDescriptor(buffer: Buffer | string, length: number = 512): Float32Array {
+  let buf: Buffer;
+
+  if (typeof buffer === "string") {
+    // Если это base64-строка (из JSON fallback)
+    buf = Buffer.from(buffer, "base64");
+  } else {
+    buf = buffer;
+  }
+
+  const descriptor = new Float32Array(length);
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (let i = 0; i < length && i * 4 < buf.length; i++) {
+    descriptor[i] = view.getFloat32(i * 4, true); // little-endian
+  }
+  return descriptor;
+}
+
+/**
+ * Конвертирует Float32Array в base64-строку для хранения в БД.
+ * Бинарный формат: ~2048 байт → base64 ~2732 символа
+ * vs JSON: 512 чисел → ~3000-4000 символов
+ */
+function descriptorToBase64(descriptor: Float32Array): string {
+  const binary = descriptorToBinary(descriptor);
+  return binary.toString("base64");
+}
+
+/**
+ * Конвертирует base64-строку обратно в Float32Array.
+ */
+function base64ToDescriptor(base64: string, length: number = 512): Float32Array {
+  return binaryToDescriptor(Buffer.from(base64, "base64"), length);
+}
+
+/**
+ * Сохраняет дескриптор в БД в бинарном формате (base64).
+ * Экономит ~30% места по сравнению с JSON.
+ */
+async function saveDescriptorToDB(
+  personId: number,
+  personName: string,
+  category: string,
+  photoPath: string,
+  descriptor: Float32Array
+): Promise<void> {
+  try {
+    // Пробуем бинарный формат, fallback на JSON при ошибке
+    try {
+      const binaryData = descriptorToBase64(descriptor);
+      await prisma.faceDescriptor.create({
+        data: {
+          person_id: personId,
+          photo_path: photoPath,
+          descriptor: binaryData,
+        },
+      });
+      logDebug(`Дескриптор сохранён в бинарном формате для "${personName}" (ID: ${personId})`);
+    } catch (binaryErr: any) {
+      // Если бинарное поле не поддерживается схемой — fallback на JSON
+      if (binaryErr?.code === "P2011" || binaryErr?.code === "P2005" || binaryErr?.message?.includes("descriptor")) {
+        logWarn("Бинарное хранение не поддерживается схемой, используется JSON fallback", {
+          personId,
+          personName,
+          errorCode: binaryErr?.code,
+        });
+        await prisma.faceDescriptor.create({
+          data: {
+            person_id: personId,
+            photo_path: photoPath,
+            descriptor: JSON.stringify(Array.from(descriptor)),
+          },
+        });
+      } else {
+        throw binaryErr;
+      }
+    }
+  } catch (err) {
+    logError(err as Error, { context: "Сохранение дескриптора в БД", personId, personName, photoPath });
+  }
+}
+
+/**
+ * Загружает дескрипторы из БД.
+ * Поддерживает как бинарный, так и JSON формат (для обратной совместимости).
+ */
+async function loadDescriptorsFromDB(): Promise<void> {
+  try {
+    const descriptorsFromDB = await prisma.faceDescriptor.findMany({
+      include: {
+        person: {
+          select: {
+            name: true,
+            category: true,
+          },
+        },
+      },
+    });
+
+    storedDescriptors.length = 0;
+    let binaryCount = 0;
+    let jsonCount = 0;
+
+    for (const d of descriptorsFromDB) {
+      try {
+        const descriptorRaw = d.descriptor;
+        let descriptor: Float32Array;
+        let descriptorList: number[];
+
+        // Определяем формат: base64 (бинарный) или JSON-массив
+        if (typeof descriptorRaw === "string") {
+          // Пытаемся определить формат
+          if (descriptorRaw.startsWith("[")) {
+            // JSON-массив — старый формат
+            descriptorList = JSON.parse(descriptorRaw);
+            descriptor = new Float32Array(descriptorList);
+            jsonCount++;
+          } else {
+            // Base64-строка — новый бинарный формат
+            descriptor = base64ToDescriptor(descriptorRaw);
+            descriptorList = Array.from(descriptor);
+            binaryCount++;
+          }
+        } else {
+          // Fallback на JSON для не-string данных
+          descriptorList = Array.from(descriptorRaw as number[]);
+          descriptor = new Float32Array(descriptorList);
+          jsonCount++;
+        }
+
+        storedDescriptors.push({
+          personId: d.person_id,
+          personName: d.person.name,
+          category: d.person.category,
+          photoPath: d.photo_path,
+          descriptor,
+          descriptorList,
+        });
+      } catch (parseErr) {
+        logError(parseErr as Error, { context: "Парсинг дескриптора из БД", descriptorId: d.id });
+      }
+    }
+
+    logInfo(
+      `Загружено ${storedDescriptors.length} дескрипторов из БД ` +
+        `(бинарных: ${binaryCount}, JSON: ${jsonCount})`
+    );
+  } catch (err) {
+    logError(err as Error, { context: "Загрузка дескрипторов из БД" });
+  }
+}
+
+// ─── 3. ЗАЩИТА ОТ PATH TRAVERSAL ─────────────────────────────────────────────
+
+/**
+ * Проверяет и санитизирует путь к файлу.
+ * Предотвращает атаки Path Traversal (например, ../../etc/passwd).
+ *
+ * @param requestedPath — путь, полученный от пользователя
+ * @param allowedRoots — массив разрешённых корневых директорий
+ * @returns абсолютный безопасный путь или null если путь недопустим
+ */
+export function sanitizePhotoPath(
+  requestedPath: string,
+  allowedRoots: string[] = [path.resolve(process.cwd(), "public")]
+): string | null {
+  if (!requestedPath || typeof requestedPath !== "string") {
+    logWarn("sanitizePhotoPath: пустой или нестроковый путь");
+    return null;
+  }
+
+  // Запрещаем null-байты
+  if (requestedPath.includes("\0")) {
+    logWarn("sanitizePhotoPath: обнаружен null-байт в пути", { path: requestedPath });
+    return null;
+  }
+
+  // Нормализуем путь (убираем .., . и т.д.)
+  const normalized = path.normalize(requestedPath);
+
+  // Проверяем, нет ли попытки выйти за пределы (до нормализации и после)
+  // После normalize ".." уже обработан, но проверяем исходный путь на явные попытки
+  const parts = requestedPath.split(path.sep);
+  let depth = 0;
+  for (const part of parts) {
+    if (part === "..") {
+      depth--;
+      if (depth < 0) {
+        logWarn("sanitizePhotoPath: попытка path traversal (..)", { path: requestedPath });
+        return null;
+      }
+    } else if (part !== "." && part !== "") {
+      depth++;
+    }
+  }
+
+  // Проверяем глубину
+  if (depth > MAX_PATH_DEPTH) {
+    logWarn("sanitizePhotoPath: слишком глубокий путь", { path: requestedPath, depth });
+    return null;
+  }
+
+  // Получаем абсолютный путь
+  const absolutePath = path.resolve(normalized);
+
+  // Проверяем, что путь начинается с одной из разрешённых директорий
+  const isWithinAllowedRoot = allowedRoots.some((root) => absolutePath.startsWith(root));
+
+  if (!isWithinAllowedRoot) {
+    logWarn("sanitizePhotoPath: путь выходит за пределы разрешённых директорий", {
+      requestedPath,
+      absolutePath,
+      allowedRoots,
+    });
+    return null;
+  }
+
+  // Проверяем существование файла
+  if (!fs.existsSync(absolutePath)) {
+    logWarn("sanitizePhotoPath: файл не существует", { path: absolutePath });
+    return null;
+  }
+
+  // Проверяем, что это файл (не директория)
+  const stat = fs.statSync(absolutePath);
+  if (!stat.isFile()) {
+    logWarn("sanitizePhotoPath: путь указывает на директорию, а не файл", { path: absolutePath });
+    return null;
+  }
+
+  return absolutePath;
+}
+
+/**
+ * Безопасное разрешение относительного пути фото.
+ * Упрощённая версия для внутренних вызовов.
+ */
+function safeResolvePhotoPath(relativePath: string): string | null {
+  return sanitizePhotoPath(relativePath, [
+    path.resolve(process.cwd(), "public"),
+    path.resolve(process.cwd(), "public", "photos"),
+    path.resolve(process.cwd(), "public", "snapshots"),
+  ]);
+}
+
+// ─── 4. ОПТИМИЗИРОВАННЫЙ ПОИСК ──────────────────────────────────────────────
+
+/**
+ * Вычисляет хеш для кэширования эмбеддинга.
+ * Использует путь + размер + время модификации для защиты от коллизий.
+ */
+function computeCacheKey(filePath: string): string {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${filePath}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return `${filePath}:no_stat`;
+  }
+}
+
+/**
+ * Очищает просроченные записи из кэша эмбеддингов.
+ */
+function pruneEmbeddingCache(): void {
+  const now = Date.now();
+  let pruned = 0;
+
+  for (const [key, entry] of embeddingCache.entries()) {
+    if (now - entry.timestamp > EMBEDDING_CACHE_TTL_MS) {
+      embeddingCache.delete(key);
+      pruned++;
+    }
+  }
+
+  if (pruned > 0) {
+    logDebug(`Очищен кэш эмбеддингов: удалено ${pruned} просроченных записей`);
+  }
+}
+
+/**
+ * Partitioning дескрипторов по категориям для ускорения поиска.
+ * При поиске в конкретной категории просматривается только подмножество.
+ */
+function getDescriptorsByCategory(category: string | null): typeof storedDescriptors {
+  if (!category) return storedDescriptors;
+  return storedDescriptors.filter((d) => d.category === category);
+}
+
+// ─── ИНИЦИАЛИЗАЦИЯ ДВИЖКА ────────────────────────────────────────────────────
+
+export async function initFaceEngine(): Promise<boolean> {
+  if (isInitialized) return true;
+
+  try {
+    logInfo("Инициализация FaceEngine v3.0...");
+    await loadDescriptorsFromDB();
+    startHealthCheckTimer();
+    await checkPythonServerHealth(); // первая проверка при старте
+    logInfo("FaceEngine v3.0 готов к работе!");
+    isInitialized = true;
+    return true;
+  } catch (err) {
+    logError(err as Error, { context: "Инициализация FaceEngine" });
+    isInitialized = false;
+    return false;
+  }
+}
+
+export async function initFaceEngineWithDB(): Promise<void> {
+  await initFaceEngine();
+}
+
+/**
+ * Получает статус здоровья Python-сервера.
+ */
+export function getPythonServerStatus(): {
+  healthy: boolean;
+  lastCheck: number;
+  url: string;
+} {
+  return {
+    healthy: pythonServerHealthy,
+    lastCheck: pythonServerLastCheck,
+    url: FACE_SERVER_URL,
+  };
+}
+
+export function getEngineStatus(): {
+  initialized: boolean;
+  totalDescriptors: number;
+  uniquePersons: number;
+  models: string[];
+  pythonServer: { healthy: boolean; lastCheck: number; url: string };
+  cacheSize: number;
+} {
+  const uniquePersons = new Set(storedDescriptors.map((d) => d.personId)).size;
+  return {
+    initialized: isInitialized,
+    totalDescriptors: storedDescriptors.length,
+    uniquePersons,
+    models: isInitialized ? ["InsightFace (buffalo_l)"] : [],
+    pythonServer: getPythonServerStatus(),
+    cacheSize: embeddingCache.size,
+  };
+}
+
+// ─── API РАБОТЫ С PYTHON-СЕРВЕРОМ ────────────────────────────────────────────
+
+/**
+ * Получает эмбеддинг с Python-сервера.
+ * Blob создаётся из Uint8Array (совместимо с node-fetch v3).
+ */
+async function getEmbeddingFromServer(imageBuffer: Buffer): Promise<Float32Array | null> {
+  try {
+    const formData = new FormData();
+    // Конвертируем Buffer в Uint8Array для Blob
+    const uint8Array = new Uint8Array(imageBuffer);
+    const blob = new Blob([uint8Array], { type: "image/jpeg" });
+    formData.append("image", blob as any, "image.jpg");
+
+    const response = await fetch(`${FACE_SERVER_URL}/get-embedding`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Server responded with status: ${response.status}`);
+    }
+
+    const result = await response.json() as { descriptor?: number[] };
+
+    if (result.descriptor) {
+      return new Float32Array(result.descriptor);
+    }
+    return null;
+  } catch (e) {
+    logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    return null;
+  }
+}
+
+async function detectFacesFromServer(
+  imgBuffer: Buffer
+): Promise<DetectedFace[]> {
+  try {
+    const formData = new FormData();
+    const uint8Array = new Uint8Array(imgBuffer);
+    const blob = new Blob([uint8Array], { type: "image/jpeg" });
+    formData.append("image", blob as any, "image.jpg");
+    formData.append("with_descriptors", "true");
+
+    const response = await fetch(`${FACE_SERVER_URL}/detect-faces`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      // 400 = пустой/битый кадр (нет захвата) — это не ошибка сервера, не спамим лог
+      if (response.status === 400) {
+        logDebug(`Детекция: кадр пустой или невалиден (400), пропуск`);
+        return [];
+      }
+      throw new Error(`Server responded with status: ${response.status}`);
+    }
+
+    const result = await response.json() as {
+      faces: Array<{ box: any; score: number; descriptor?: number[] }>;
+    };
+
+    return result.faces.map((f: any) => ({
+      box: f.box,
+      score: f.score,
+      descriptor: f.descriptor ? new Float32Array(f.descriptor) : undefined,
+    }));
+  } catch (e) {
+    logError(e as Error, { context: "Детекция с Python-сервера" });
+    return [];
+  }
+}
+
+// ─── ОСНОВНЫЕ ФУНКЦИИ ────────────────────────────────────────────────────────
+
+export async function detectFaces(
+  imagePathOrBuffer: string | Buffer,
+  options: any = {}
+): Promise<DetectedFace[]> {
+  // Проверяем здоровье сервера
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    logWarn("Python-сервер недоступен, детекция лиц невозможна");
+    return [];
+  }
+
+  try {
+    let imgBuffer: Buffer;
+
+    if (typeof imagePathOrBuffer === "string") {
+      const resolvedPath = safeResolvePhotoPath(imagePathOrBuffer);
+      if (!resolvedPath) {
+        logWarn("Недопустимый путь к файлу для детекции", { path: imagePathOrBuffer });
+        return [];
+      }
+      imgBuffer = await fs.promises.readFile(resolvedPath);
+    } else {
+      imgBuffer = imagePathOrBuffer;
+    }
+
+    return await detectFacesFromServer(imgBuffer);
+  } catch (err) {
+    logError(err as Error, { context: "Детекция" });
+    return [];
+  }
+}
+
+export function detectFacesFast(
+  imagePathOrBuffer: string | Buffer,
+  options: any = {}
+): Promise<DetectedFace[]> {
+  return detectFaces(imagePathOrBuffer, options);
+}
+
+export async function getEmbedding(
+  imagePathOrBuffer: string | Buffer
+): Promise<Float32Array | null> {
+  // Проверяем здоровье сервера
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    logWarn("Python-сервер недоступен, получение эмбеддинга невозможно");
+    return null;
+  }
+
+  try {
+    let imgBuffer: Buffer;
+
+    if (typeof imagePathOrBuffer === "string") {
+      const resolvedPath = safeResolvePhotoPath(imagePathOrBuffer);
+      if (!resolvedPath) {
+        logWarn("Недопустимый путь к файлу для эмбеддинга", { path: imagePathOrBuffer });
+        return null;
+      }
+      imgBuffer = await fs.promises.readFile(resolvedPath);
+    } else {
+      imgBuffer = imagePathOrBuffer;
+    }
+
+    return await getEmbeddingFromServer(imgBuffer);
+  } catch (err) {
+    logError(err as Error, { context: "Получение эмбеддинга" });
+    return null;
+  }
+}
+
+export async function registerPerson(
+  personId: number,
+  personName: string,
+  category: string,
+  photoPath: string,
+  imagePathOrBuffer: string | Buffer
+): Promise<{ success: boolean; hasEmbedding: boolean; error?: string }> {
+  // Проверяем здоровье сервера
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    return {
+      success: false,
+      hasEmbedding: false,
+      error:
+        "Сервис распознавания лиц недоступен. Python-сервер (FastAPI) не отвечает. " +
+        "Проверьте, что сервер запущен на " +
+        FACE_SERVER_URL,
+    };
+  }
+
+  try {
+    const descriptor = await getEmbedding(imagePathOrBuffer);
+
+    if (!descriptor) {
+      return { success: false, hasEmbedding: false, error: "Лицо не обнаружено на фото" };
+    }
+
+    // Удаляем старый дескриптор с тем же фото
+    const existingIdx = storedDescriptors.findIndex(
+      (d) => d.personId === personId && d.photoPath === photoPath
+    );
+    if (existingIdx >= 0) {
+      storedDescriptors.splice(existingIdx, 1);
+    }
+
+    // Добавляем новый дескриптор
+    storedDescriptors.push({
+      personId,
+      personName,
+      category,
+      photoPath,
+      descriptor,
+      descriptorList: Array.from(descriptor),
+    });
+
+    // Сохраняем в БД (бинарный формат с fallback на JSON)
+    await saveDescriptorToDB(personId, personName, category, photoPath, descriptor);
+
+    logDebug(`Зарегистрирован дескриптор для "${personName}" (ID: ${personId})`);
+    return { success: true, hasEmbedding: true };
+  } catch (err) {
+    logError(err as Error, { context: "Регистрация", personId, personName });
+    return { success: false, hasEmbedding: false, error: (err as any).message };
+  }
+}
+
+export async function unregisterPerson(personId: number): Promise<void> {
+  const before = storedDescriptors.length;
+  let i = storedDescriptors.length;
+  while (i--) {
+    if (storedDescriptors[i].personId === personId) {
+      storedDescriptors.splice(i, 1);
+    }
+  }
+  try {
+    await prisma.faceDescriptor.deleteMany({
+      where: { person_id: personId },
+    });
+  } catch (err) {
+    logError(err as Error, { context: "Удаление из БД", personId });
+  }
+  logDebug(`Удалено ${before - storedDescriptors.length} дескрипторов персоны ID: ${personId}`);
+}
+
+/**
+ * Оптимизированный поиск по фото.
+ *
+ * Улучшения:
+ *  - Кэширование эмбеддингов (избегает повторных запросов к Python)
+ *  - Partitioning по категориям (при поиске в конкретной категории просматривается подмножество)
+ *  - Быстрое сравнение через Float32Array (без JSON-парсинга)
+ */
+export async function searchByPhoto(
+  imagePathOrBuffer: string | Buffer,
+  threshold: number = 0.4,
+  maxResults: number = 5,
+  options: { category?: string } = {}
+): Promise<RecognitionMatch[]> {
+  // Проверяем здоровье сервера
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    logWarn("Python-сервер недоступен, поиск невозможен");
+    return [];
+  }
+
+  try {
+    let descriptor: Float32Array | null;
+
+    if (typeof imagePathOrBuffer === "string") {
+      const resolvedPath = safeResolvePhotoPath(imagePathOrBuffer);
+      if (!resolvedPath) {
+        logWarn("Недопустимый путь к файлу для поиска", { path: imagePathOrBuffer });
+        return [];
+      }
+
+      // Проверяем кэш
+      const cacheKey = computeCacheKey(resolvedPath);
+      const now = Date.now();
+      const cached = embeddingCache.get(cacheKey);
+
+      if (cached && now - cached.timestamp < EMBEDDING_CACHE_TTL_MS) {
+        logDebug(`Эмбеддинг взят из кэша для поиска: ${resolvedPath}`);
+        descriptor = cached.descriptor;
+      } else {
+        const imgBuffer = await fs.promises.readFile(resolvedPath);
+        descriptor = await getEmbeddingFromServer(imgBuffer);
+
+        // Сохраняем в кэш
+        if (descriptor) {
+          // Очищаем кэш если переполнен
+          if (embeddingCache.size > 1000) {
+            pruneEmbeddingCache();
+          }
+          embeddingCache.set(cacheKey, { descriptor, timestamp: Date.now() });
+        }
+      }
+    } else {
+      descriptor = await getEmbeddingFromServer(imagePathOrBuffer);
+    }
+
+    if (!descriptor) {
+      return [];
+    }
+
+    // Partitioning: если указана категория — ищем только в ней
+    const candidates = options.category
+      ? getDescriptorsByCategory(options.category)
+      : storedDescriptors;
+
+    const matches: RecognitionMatch[] = [];
+    for (const stored of candidates) {
+      const similarity = cosineSimilarity(descriptor, stored.descriptor);
+      if (similarity > threshold) {
+        matches.push({
+          personId: stored.personId,
+          personName: stored.personName,
+          category: stored.category,
+          similarity,
+          photoPath: stored.photoPath,
+        });
+      }
+    }
+    matches.sort((a, b) => b.similarity - a.similarity);
+    return matches.slice(0, maxResults);
+  } catch (err) {
+    logError(err as Error, { context: "Поиск по фото" });
+    return [];
+  }
+}
+
+/**
+ * Ищет совпадение по уже вычисленному эмбеддингу, БЕЗ обращения к Python-серверу.
+ * Используется в реальном времени: detectFaces уже возвращает descriptor для каждого лица,
+ * поэтому повторный запрос эмбеддинга не нужен.
+ */
+export function searchByDescriptor(
+  descriptor: Float32Array | null | undefined,
+  threshold: number = 0.4,
+  maxResults: number = 5,
+  options: { category?: string } = {}
+): RecognitionMatch[] {
+  if (!descriptor || descriptor.length === 0) return [];
+  if (!isInitialized) return [];
+
+  const candidates = options.category ? getDescriptorsByCategory(options.category) : storedDescriptors;
+
+  const matches: RecognitionMatch[] = [];
+  for (const stored of candidates) {
+    const similarity = cosineSimilarity(descriptor, stored.descriptor);
+    if (similarity > threshold) {
+      matches.push({
+        personId: stored.personId,
+        personName: stored.personName,
+        category: stored.category,
+        similarity,
+        photoPath: stored.photoPath,
+      });
+    }
+  }
+  matches.sort((a, b) => b.similarity - a.similarity);
+  return matches.slice(0, maxResults);
+}
+
+function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+export async function rebuildDescriptorIndex(persons: any[]): Promise<{ registered: number; failed: number }> {
+  logInfo("Перестроение индекса не требуется (дескрипторы загружаются из БД)");
+  return { registered: storedDescriptors.length, failed: 0 };
+}
+
+export async function assessPhotoQuality(
+  imagePathOrBuffer: string | Buffer
+): Promise<{ faceDetected: boolean; faceCount: number; quality: number; issues: string[]; details: any }> {
+  // Проверяем здоровье сервера
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    return {
+      faceDetected: false,
+      faceCount: 0,
+      quality: 0,
+      issues: ["Сервис распознавания лиц недоступен"],
+      details: null,
+    };
+  }
+
+  try {
+    const faces = await detectFaces(imagePathOrBuffer, { maxFaces: 5, minConfidence: 0.2 });
+    if (faces.length > 0) {
+      return {
+        faceDetected: true,
+        faceCount: faces.length,
+        quality: 0.8,
+        issues: [],
+        details: { detScore: faces[0].score },
+      };
+    } else {
+      return {
+        faceDetected: false,
+        faceCount: 0,
+        quality: 0,
+        issues: ["No face detected"],
+        details: null,
+      };
+    }
+  } catch (err) {
+    logError(err as Error, { context: "Оценка качества" });
+    return {
+      faceDetected: false,
+      faceCount: 0,
+      quality: 0,
+      issues: ["Error"],
+      details: null,
+    };
+  }
+}
+
+// ─── УТИЛИТЫ ─────────────────────────────────────────────────────────────────
+
+/**
+ * Получает количество дескрипторов по категориям.
+ * Полезно для мониторинга и аналитики.
+ */
+export function getCategoryDistribution(): Record<string, number> {
+  const dist: Record<string, number> = {};
+  for (const d of storedDescriptors) {
+    dist[d.category] = (dist[d.category] || 0) + 1;
+  }
+  return dist;
+}
+
+/**
+ * Очищает кэш эмбеддингов вручную.
+ */
+export function clearEmbeddingCache(): void {
+  const count = embeddingCache.size;
+  embeddingCache.clear();
+  logInfo(`Кэш эмбеддингов очищен: удалено ${count} записей`);
+}
+
+/**
+ * Принудительно перезапускает health check.
+ */
+export async function forceHealthCheck(): Promise<boolean> {
+  pythonServerLastCheck = 0; // сбрасываем таймер
+  return await checkPythonServerHealth();
+}

@@ -1,0 +1,174 @@
+@import "tailwindcss";
+
+@theme {
+  --color-kraken-base: #0B0F14;
+  --color-kraken-secondary: #0F141B;
+  --color-kraken-panel: #121A24;
+  --color-kraken-border: #1F2A36;
+  --color-kraken-hover: #1A2330;
+  --color-kraken-text: #E6EDF3;
+  --color-kraken-muted: #9AA6B2;
+  --color-kraken-disabled: #5B6570;
+  --color-kraken-green: #00FF94;
+  --color-kraken-green-hover: #00C97A;
+  --color-kraken-red: #FF3B3B;
+  --color-kraken-red-active: #FF1F1F;
+  --color-kraken-blue: #3BA4FF;
+  --color-kraken-purple: #7B61FF;
+  --color-kraken-purple-hover: #9B7BFF;
+  --color-kraken-orange: #FF8C00;
+  --color-kraken-orange-hover: #E07800;
+  --color-kraken-gold: #F5C518;
+  --color-kraken-gold-hover: #D4A800;
+
+  --shadow-glow-purple: 0 0 20px rgba(123,97,255,0.15);
+  --shadow-glow-green: 0 0 20px rgba(0,255,148,0.2);
+  --shadow-glow-red: 0 0 20px rgba(255,59,59,0.3);
+  --shadow-glow-orange: 0 0 20px rgba(255,140,0,0.35);
+
+  --animate-pulse-slow: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-fade-in: fadeIn 0.3s ease-in-out;
+  --animate-slide-in: slideIn 0.3s ease-out;
+  --animate-slide-up: slideUp 0.25s ease-out;
+
+  @keyframes fadeIn {
+    0% { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  @keyframes slideIn {
+    0% { transform: translateX(100%); opacity: 0; }
+    100% { transform: translateX(0); opacity: 1; }
+  }
+  @keyframes slideUp {
+    0% { transform: translateY(100%); opacity: 0; }
+    100% { transform: translateY(0); opacity: 1; }
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: #0B0F14;
+  color: #E6EDF3;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F14;
+}
+::-webkit-scrollbar-thumb {
+  background: #2B3948;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3B4958;
+}
+
+/* Utilities / Components */
+.badge-vip {
+  @apply bg-kraken-green text-black text-xs font-bold px-2 py-0.5 rounded-full;
+}
+.badge-blacklist {
+  @apply bg-kraken-red text-white text-xs font-bold px-2 py-0.5 rounded-full;
+}
+.badge-staff {
+  @apply bg-kraken-blue text-white text-xs font-bold px-2 py-0.5 rounded-full;
+}
+.badge-client {
+  @apply bg-kraken-hover text-kraken-muted text-xs font-bold px-2 py-0.5 rounded-full border border-kraken-border;
+}
+.badge-unknown {
+  @apply bg-kraken-disabled text-kraken-text text-xs font-bold px-2 py-0.5 rounded-full;
+}
+.badge-response {
+  @apply bg-kraken-orange text-white text-xs font-bold px-2 py-0.5 rounded-full;
+}
+.badge-security {
+  background-color: #F5C518;
+  color: #000;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.btn-primary {
+  @apply bg-kraken-purple hover:bg-kraken-purple-hover text-white px-4 py-2 rounded-lg transition-colors font-medium;
+}
+.btn-danger {
+  @apply bg-kraken-red hover:bg-kraken-red-active text-white px-4 py-2 rounded-lg transition-colors font-medium;
+}
+.btn-ghost {
+  @apply border border-kraken-border text-kraken-muted hover:text-kraken-text hover:border-kraken-purple px-4 py-2 rounded-lg transition-colors;
+}
+
+.panel {
+  @apply bg-kraken-panel rounded-xl border border-kraken-border;
+}
+
+.nav-item {
+  @apply flex items-center gap-3 px-4 py-2.5 rounded-lg text-kraken-muted hover:text-kraken-text transition-colors cursor-pointer;
+}
+.nav-item.active {
+  @apply bg-kraken-purple/15 text-kraken-text border-l-2 border-kraken-purple;
+}
+
+/* Системные требования — метка и значение строго друг под другом */
+.kraken-req-group {
+  @apply pl-2 sm:pl-3 space-y-3 min-w-0;
+}
+.kraken-req-line {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+}
+.kraken-req-line + .kraken-req-line {
+  margin-top: 0.75rem;
+}
+.kraken-req-tag {
+  display: block;
+  font-size: 10px;
+  line-height: 1.35;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin: 0 0 0.35rem 0;
+  padding: 0;
+  white-space: normal;
+  word-break: normal;
+}
+.kraken-req-tag--min {
+  color: #6b7c8f;
+}
+.kraken-req-tag--rec {
+  color: #3dd68c;
+}
+.kraken-req-value {
+  display: block;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  margin: 0;
+  padding: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.kraken-req-value--min {
+  color: #e6edf3;
+  font-weight: 500;
+}
+.kraken-req-value--rec {
+  color: #3dd68c;
+  font-weight: 600;
+}

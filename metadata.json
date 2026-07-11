@@ -1,0 +1,6 @@
+{
+  "name": "Smart Security Monitor",
+  "description": "A highly polished and modular video surveillance, face recognition, and customer loyalty tracking system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
