@@ -104,7 +104,7 @@ async function checkPythonServerHealth(): Promise<boolean> {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
 
-      const response = await fetch(`${FACE_SERVER_URL}/health`, {
+      const response = await apiFetchWithKey(`${FACE_SERVER_URL}/health`, {
         method: "GET",
         signal: controller.signal,
       });
@@ -418,8 +418,13 @@ export function sanitizePhotoPath(
   // Получаем абсолютный путь
   const absolutePath = path.resolve(normalized);
 
-  // Проверяем, что путь начинается с одной из разрешённых директорий
-  const isWithinAllowedRoot = allowedRoots.some((root) => absolutePath.startsWith(root));
+  // Проверяем, что путь находится внутри одной из разрешённых директорий.
+  // Используем path.relative + startsWith("..") вместо простого startsWith,
+  // чтобы избежать prefix-bypass: /root/public-evil/... не должен проходить.
+  const isWithinAllowedRoot = allowedRoots.some((root) => {
+    const relative = path.relative(root, absolutePath);
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  });
 
   if (!isWithinAllowedRoot) {
     logWarn("sanitizePhotoPath: путь выходит за пределы разрешённых директорий", {
@@ -561,6 +566,19 @@ export function getEngineStatus(): {
 
 // ─── API РАБОТЫ С PYTHON-СЕРВЕРОМ ────────────────────────────────────────────
 
+function getApiHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (FACE_API_KEY) {
+    headers["X-API-Key"] = FACE_API_KEY;
+  }
+  return headers;
+}
+
+async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Promise<any> {
+  const headers = { ...(init.headers || {}), ...getApiHeaders() };
+  return fetch(input, { ...init, headers } as any);
+}
+
 /**
  * Получает эмбеддинг с Python-сервера.
  * Blob создаётся из Uint8Array (совместимо с node-fetch v3).
@@ -573,7 +591,7 @@ async function getEmbeddingFromServer(imageBuffer: Buffer): Promise<Float32Array
     const blob = new Blob([uint8Array], { type: "image/jpeg" });
     formData.append("image", blob as any, "image.jpg");
 
-    const response = await fetch(`${FACE_SERVER_URL}/get-embedding`, {
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/get-embedding`, {
       method: "POST",
       body: formData,
     });
@@ -604,7 +622,7 @@ async function detectFacesFromServer(
     formData.append("image", blob as any, "image.jpg");
     formData.append("with_descriptors", "true");
 
-    const response = await fetch(`${FACE_SERVER_URL}/detect-faces`, {
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/detect-faces`, {
       method: "POST",
       body: formData,
     });
@@ -650,7 +668,7 @@ async function recognizeDescriptorOnServer(
       url.searchParams.set("threshold", String(options.threshold));
     }
 
-    const response = await fetch(url.toString(), {
+    const response = await apiFetchWithKey(url.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -694,14 +712,9 @@ async function syncIndexWithPython(): Promise<void> {
       descriptor: Array.from(d.descriptor),
     }));
 
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (FACE_API_KEY) {
-      headers["X-API-Key"] = FACE_API_KEY;
-    }
-
-    const response = await fetch(`${FACE_SERVER_URL}/update-index`, {
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/update-index`, {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ persons }),
     });
 

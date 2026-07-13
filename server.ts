@@ -122,10 +122,10 @@ function initDirectories() {
 }
 initDirectories();
 
-// Serve the uploaded photos, snapshots, and recordings statically
-app.use("/photos", express.static(photosDir));
-app.use("/snapshots", express.static(snapshotsDir));
-app.use("/recordings", express.static(recordingsDir));
+// Serve the uploaded photos, snapshots, and recordings statically with API-key protection
+app.use("/photos", apiKeyAuth, express.static(photosDir));
+app.use("/snapshots", apiKeyAuth, express.static(snapshotsDir));
+app.use("/recordings", apiKeyAuth, express.static(recordingsDir));
 
 // Multer upload setup
 const storage = multer.diskStorage({
@@ -1328,7 +1328,15 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
     const photo = await prisma.personPhoto.findUnique({ where: { id: photoId } });
     if (!photo) return res.status(404).json({ detail: "Photo not found" });
 
+    const photoPath = photo.photo_path;
     await prisma.personPhoto.delete({ where: { id: photoId } });
+
+    try {
+      const fullPath = path.join(photosDir, photoPath);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    } catch (e) {
+      logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
+    }
 
     // Если удалили primary — назначаем первую оставшуюся
     if (photo.is_primary) {
@@ -1965,28 +1973,59 @@ app.delete("/api/chronicle/camera/:activeCameraId/day/:date/photo/:filename", (r
   if (chronicleData[camId] && chronicleData[camId][date]) {
     chronicleData[camId][date] = chronicleData[camId][date].filter(v => v.filename !== filename);
   }
+
+  try {
+    const fullPath = path.join(snapshotsDir, filename);
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+  } catch (e) {
+    logError(e as Error, { context: "delete-chronicle-photo-file", filename });
+  }
+
   res.json({ success: true });
 });
 
 app.delete("/api/chronicle/camera/:activeCameraId/day/:date", (req, res) => {
   const camId = parseInt(req.params.activeCameraId);
   const date = req.params.date;
+  const files = chronicleData[camId]?.[date] || [];
   if (chronicleData[camId]) {
     delete chronicleData[camId][date];
   }
+
+  try {
+    for (const item of files) {
+      const fullPath = path.join(snapshotsDir, item.filename);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    }
+  } catch (e) {
+    logError(e as Error, { context: "delete-chronicle-day", camId, date });
+  }
+
   res.json({ success: true });
 });
 
 app.delete("/api/chronicle/camera/:activeCameraId/month/:month", (req, res) => {
   const camId = parseInt(req.params.activeCameraId);
   const month = req.params.month;
+  const removed: string[] = [];
   if (chronicleData[camId]) {
     for (const date of Object.keys(chronicleData[camId])) {
       if (date.startsWith(month)) {
+        removed.push(...chronicleData[camId][date].map(v => v.filename));
         delete chronicleData[camId][date];
       }
     }
   }
+
+  try {
+    for (const filename of removed) {
+      const fullPath = path.join(snapshotsDir, filename);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    }
+  } catch (e) {
+    logError(e as Error, { context: "delete-chronicle-month", camId, month });
+  }
+
   res.json({ success: true });
 });
 
@@ -2114,15 +2153,33 @@ app.delete("/api/recordings/camera/:activeCameraId/day/:date/video/:filename", (
   if (recordingsData[camId] && recordingsData[camId][date]) {
     recordingsData[camId][date] = recordingsData[camId][date].filter(v => v.filename !== filename);
   }
+
+  try {
+    const fullPath = path.join(recordingsDir, filename);
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+  } catch (e) {
+    logError(e as Error, { context: "delete-recording-file", filename });
+  }
+
   res.json({ success: true });
 });
 
 app.delete("/api/recordings/camera/:activeCameraId/day/:date", (req, res) => {
   const camId = parseInt(req.params.activeCameraId);
   const date = req.params.date;
-  if (recordingsData[camId]) {
-    delete recordingsData[camId][date];
+  const files = recordingsData[camId]?.[date] || [];
+  recordingsData[camId] = recordingsData[camId] || {};
+  delete recordingsData[camId][date];
+
+  try {
+    for (const item of files) {
+      const fullPath = path.join(recordingsDir, item.filename);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    }
+  } catch (e) {
+    logError(e as Error, { context: "delete-recordings-day", camId, date });
   }
+
   res.json({ success: true });
 });
 

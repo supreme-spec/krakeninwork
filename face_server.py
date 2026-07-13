@@ -32,7 +32,7 @@ MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "60"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.8"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.55"))
-API_KEY: str = os.getenv("FACE_API_KEY", "super-secret-change-me")
+API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -405,7 +405,7 @@ async def get_health() -> Dict[str, Any]:
     }
 
 
-@app.post("/detect-faces")
+@app.post("/detect-faces", dependencies=[Depends(verify_api_key)])
 async def detect_faces(
     image: UploadFile = File(...),
     max_faces: Optional[int] = 20,
@@ -455,7 +455,7 @@ async def detect_faces(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/get-embedding")
+@app.post("/get-embedding", dependencies=[Depends(verify_api_key)])
 async def get_embedding(image: UploadFile = File(...)):
     """Extracts face embedding from image. Applies quality gate."""
     try:
@@ -489,7 +489,7 @@ async def get_embedding(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/recognize")
+@app.post("/recognize", dependencies=[Depends(verify_api_key)])
 async def recognize(
     image: UploadFile = File(...),
     top_k: Optional[int] = 5,
@@ -663,7 +663,7 @@ async def update_index(payload: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/compare-faces")
+@app.post("/compare-faces", dependencies=[Depends(verify_api_key)])
 async def compare_faces(
     descriptor1: UploadFile = File(...),
     descriptor2: UploadFile = File(...)
