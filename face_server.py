@@ -75,7 +75,9 @@ frame_lock = threading.Lock()
 
 # ─── Security Middleware ──────────────────────────────────────────────────────
 
-def verify_api_key(x_api_key: str = Header(None)):
+def verify_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
+    if not API_KEY:
+        return True
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return True
@@ -567,7 +569,7 @@ async def recognize(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/recognize-by-descriptor")
+@app.post("/recognize-by-descriptor", dependencies=[Depends(verify_api_key)])
 async def recognize_by_descriptor(
     payload: Dict[str, Any],
     top_k: Optional[int] = 5,
