@@ -14,6 +14,7 @@ import sqlite3
 import base64
 import time
 import threading
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -37,6 +38,22 @@ RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
 EMBED_MIN_FACE_SIZE: int = int(os.getenv("FACE_EMBED_MIN_FACE_SIZE", "28"))
+
+# ── ПОРОГИ КАЧЕСТВА ДЛЯ ВОРОТ (ENROLLMENT GATE) ───────────────────────────────
+# Жёсткие пороги при ЗАПИСИ РЕФЕРЕНСНОГО эмбеддинга. Мусорные кадры (размытие,
+# критический наклон головы, темнота, несколько лиц) НЕ должны попадать в БД —
+# иначе они портят поиск. Для живого распознавания используется мягкий путь.
+# Нормированная резкость (0..1, через вариацию Лапласиана).
+ENROLL_SHARPNESS_SCORE_MIN: float = float(os.getenv("FACE_ENROLL_SHARPNESS_MIN", "0.35"))
+# Допустимый угол поворота головы (градусы) по pitch/yaw.
+ENROLL_PITCH_MAX_DEG: float = float(os.getenv("FACE_ENROLL_PITCH_MAX", "35.0"))
+ENROLL_YAW_MAX_DEG: float = float(os.getenv("FACE_ENROLL_YAW_MAX", "35.0"))
+# Средняя яркость лица (0..255, grayscale). Ниже — «темнота».
+ENROLL_BRIGHTNESS_MIN: float = float(os.getenv("FACE_ENROLL_BRIGHTNESS_MIN", "40.0"))
+# Максимум лиц в кадре при записи (несколько лиц = неоднозначность).
+ENROLL_MAX_FACES: int = int(os.getenv("FACE_ENROLL_MAX_FACES", "1"))
+# Калибровочный коэффициент «средняя яркость -> примерный люкс» (грубо, для UI).
+BRIGHTNESS_TO_LUX: float = float(os.getenv("FACE_BRIGHTNESS_TO_LUX", "0.8"))
 ENABLE_PREPROCESS: bool = os.getenv("FACE_ENABLE_PREPROCESS", "1") not in ("0", "false", "False")
 API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
@@ -346,6 +363,184 @@ def passes_quality_gate(face: Any) -> bool:
     return True
 
 
+# ─── Quality Assessment (CV metrics) ──────────────────────────────────────────
+
+def _crop_face_region(img: np.ndarray, bbox: np.ndarray, pad_ratio: float = 0.2) -> Optional[np.ndarray]:
+    """Возвращает кроп лица с запасом по краям (RGB) либо None."""
+    if img is None or img.size == 0:
+        return None
+    try:
+        x1, y1, x2, y2 = bbox.astype(int).tolist()[:4]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        pad = int(max(w, h) * pad_ratio)
+        top = max(0, y1 - pad)
+        left = max(0, x1 - pad)
+        bottom = min(img.shape[0], y2 + pad)
+        right = min(img.shape[1], x2 + pad)
+        if right <= left or bottom <= top:
+            return None
+        return img[top:bottom, left:right]
+    except Exception:
+        return None
+
+
+def estimate_sharpness(face_crop: Optional[np.ndarray]) -> float:
+    """
+    Резкость лица через дисперсию Лапласиана (вариацию).
+    Низкое значение = размытие в движении / расфокус.
+    """
+    if face_crop is None or face_crop.size == 0:
+        return 0.0
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY) if face_crop.ndim == 3 else face_crop
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def estimate_brightness(face_crop: Optional[np.ndarray]) -> float:
+    """Средняя яркость лица (grayscale 0..255). Низкая = недостаточная освещённость."""
+    if face_crop is None or face_crop.size == 0:
+        return 0.0
+    try:
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY) if face_crop.ndim == 3 else face_crop
+        return float(np.mean(gray))
+    except Exception:
+        return 0.0
+
+
+def estimate_head_pose(kps: Optional[np.ndarray], img_shape: tuple) -> Optional[Dict[str, float]]:
+    """
+    Оценка позы головы (pitch/yaw/roll в градусах) через PnP по 5 ландмаркам
+    InsightFace (порядок: [right eye, left eye, nose, right mouth, left mouth]).
+    Возвращает None, если решить PnP не удалось.
+    """
+    if kps is None or len(kps) < 5 or img_shape is None or len(img_shape) < 2:
+        return None
+    try:
+        # image_points: [nose, left eye, right eye, left mouth, right mouth]
+        image_points = np.array([
+            [float(kps[2][0]), float(kps[2][1])],
+            [float(kps[1][0]), float(kps[1][1])],
+            [float(kps[0][0]), float(kps[0][1])],
+            [float(kps[4][0]), float(kps[4][1])],
+            [float(kps[3][0]), float(kps[3][1])],
+        ], dtype=np.float64)
+
+        # Усреднённая 3D-модель лица (мм), ось Y вниз.
+        model_points = np.array([
+            [0.0, 0.0, 0.0],            # nose tip
+            [-225.0, 170.0, -135.0],    # left eye
+            [225.0, 170.0, -135.0],     # right eye
+            [-150.0, -150.0, -125.0],   # left mouth corner
+            [150.0, -150.0, -125.0],    # right mouth corner
+        ], dtype=np.float64)
+
+        h, w = img_shape[:2]
+        focal_length = float(w)
+        center = (w / 2.0, h / 2.0)
+        camera_matrix = np.array(
+            [[focal_length, 0.0, center[0]], [0.0, focal_length, center[1]], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        success, rvec, _ = cv2.solvePnP(
+            model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        if not success:
+            return None
+
+        rmat, _ = cv2.Rodrigues(rvec)
+        sy = math.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
+        singular = sy < 1e-6
+        if not singular:
+            pitch = math.atan2(rmat[2, 1], rmat[2, 2])
+            yaw = math.atan2(-rmat[2, 0], sy)
+            roll = math.atan2(rmat[1, 0], rmat[0, 0])
+        else:
+            pitch = math.atan2(-rmat[1, 2], rmat[1, 1])
+            yaw = math.atan2(-rmat[2, 0], sy)
+            roll = 0.0
+
+        return {
+            "pitch": round(math.degrees(pitch), 2),
+            "yaw": round(math.degrees(yaw), 2),
+            "roll": round(math.degrees(roll), 2),
+        }
+    except Exception as e:
+        logger.debug(f"Head pose estimation failed: {e}")
+        return None
+
+
+def _norm_sharpness(lap_var: float, ref: float = 200.0) -> float:
+    """Нормировка дисперсии Лапласиана в 0..1: 0 -> 0, ref -> ~0.86."""
+    return float(min(1.0, max(0.0, 1.0 - math.exp(-lap_var / ref))))
+
+
+def _norm_brightness(mean_gray: float, max_b: float = 255.0) -> float:
+    return float(min(1.0, max(0.0, mean_gray / max_b)))
+
+
+def compute_face_quality(face: Any, img: Optional[np.ndarray], face_count: int = 1) -> Dict[str, Any]:
+    """
+    Считает комплексные метрики качества для одного лица.
+    Возвращает сырые метрики, нормированные суб-скоры и итоговый score (0..1).
+    """
+    crop = _crop_face_region(img, face.bbox) if img is not None else None
+    sharp = estimate_sharpness(crop)
+    bright = estimate_brightness(crop)
+    pose = estimate_head_pose(face.kps, img.shape) if (img is not None and hasattr(face, "kps")) else None
+
+    sharp_n = _norm_sharpness(sharp)
+    bright_n = _norm_brightness(bright)
+    if pose is not None:
+        max_angle = max(abs(pose["pitch"]), abs(pose["yaw"]), abs(pose["roll"]))
+        pose_n = max(0.0, 1.0 - max_angle / 90.0)
+    else:
+        pose_n = 0.5
+
+    # Итоговый score — жёсткое пересечение (min) суб-скоров: один провал =
+    # низкое качество. Яркость/резкость масштабируются, чтобы «нормальный»
+    # кадр давал ~0.8-0.95, а мусорный — < 0.3.
+    score = round(min(sharp_n, 0.4 + 0.6 * bright_n, pose_n), 4)
+
+    return {
+        "sharpness": round(sharp, 2),
+        "sharpness_score": round(sharp_n, 4),
+        "brightness": round(bright, 2),
+        "brightness_score": round(bright_n, 4),
+        "approx_lux": round(bright * BRIGHTNESS_TO_LUX, 1),
+        "pitch": pose["pitch"] if pose else None,
+        "yaw": pose["yaw"] if pose else None,
+        "roll": pose["roll"] if pose else None,
+        "face_count": int(face_count),
+        "score": score,
+    }
+
+
+def enrollment_issues(quality: Dict[str, Any]) -> List[str]:
+    """
+    Возвращает список причин, по которым кадр НЕ годится для записи
+    референсного эмбеддинга. Пустой список = кадр годен.
+    """
+    issues: List[str] = []
+    if quality.get("sharpness_score", 1.0) < ENROLL_SHARPNESS_SCORE_MIN:
+        issues.append("Размытие в движении (Motion Blur)")
+    pitch = quality.get("pitch")
+    if pitch is not None and abs(pitch) > ENROLL_PITCH_MAX_DEG:
+        issues.append(f"Недопустимый угол поворота головы (Pitch > {ENROLL_PITCH_MAX_DEG:g}°)")
+    yaw = quality.get("yaw")
+    if yaw is not None and abs(yaw) > ENROLL_YAW_MAX_DEG:
+        issues.append(f"Недопустимый угол поворота головы (Yaw > {ENROLL_YAW_MAX_DEG:g}°)")
+    if quality.get("brightness", 255.0) < ENROLL_BRIGHTNESS_MIN:
+        issues.append("Недостаточная освещённость лица")
+    if quality.get("face_count", 1) > ENROLL_MAX_FACES:
+        issues.append("Обнаружено несколько лиц в кадре")
+    return issues
+
+
 # ─── Cooldown / Debounce ──────────────────────────────────────────────────────
 
 def get_cooldown_key(person_id: Any, category: str = "") -> str:
@@ -399,6 +594,11 @@ async def get_status() -> Dict[str, Any]:
         "min_face_size": MIN_FACE_SIZE,
         "cooldown_seconds": COOLDOWN_SECONDS,
         "recognition_threshold": RECOGNITION_THRESHOLD,
+        "enroll_sharpness_min": ENROLL_SHARPNESS_SCORE_MIN,
+        "enroll_pitch_max_deg": ENROLL_PITCH_MAX_DEG,
+        "enroll_yaw_max_deg": ENROLL_YAW_MAX_DEG,
+        "enroll_brightness_min": ENROLL_BRIGHTNESS_MIN,
+        "enroll_max_faces": ENROLL_MAX_FACES,
     }
 
 
@@ -417,6 +617,7 @@ async def detect_faces(
     max_faces: Optional[int] = 20,
     min_confidence: Optional[float] = None,
     with_descriptors: Optional[bool] = False,
+    with_quality: Optional[bool] = False,
 ):
     """Detects faces on image. Applies quality gate."""
     try:
@@ -449,6 +650,16 @@ async def detect_faces(
             }
             if with_descriptors and hasattr(face, "embedding") and face.embedding is not None:
                 detection["descriptor"] = face.embedding.tolist()
+            if with_quality:
+                quality = compute_face_quality(face, img, len(faces))
+                detection["quality"] = quality
+                detection["pose"] = {
+                    "pitch": quality["pitch"],
+                    "yaw": quality["yaw"],
+                    "roll": quality["roll"],
+                }
+                detection["enrollment_issues"] = enrollment_issues(quality)
+                detection["enrollment_ok"] = len(detection["enrollment_issues"]) == 0
             results.append(detection)
 
         return {"faces": results}
@@ -461,9 +672,96 @@ async def detect_faces(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/assess-quality", dependencies=[Depends(verify_api_key)])
+async def assess_quality(image: UploadFile = File(...)):
+    """
+    Полная оценка качества кадра для извлечения эмбеддинга.
+    Возвращает метрики для ВСЕХ лиц + агрегированный вердикт о пригодности
+    кадра к записи референсного эмбеддинга (enrollment_issues / enrollment_ok).
+    """
+    try:
+        image_bytes = await image.read()
+        img = load_image_from_bytes(image_bytes)
+
+        if img is None or img.size == 0:
+            raise HTTPException(status_code=400, detail="Empty or invalid image")
+
+        if not is_initialized or face_app is None:
+            return {
+                "face_detected": False,
+                "face_count": 0,
+                "quality": 0.0,
+                "issues": ["Сервис распознавания лиц недоступен"],
+                "faces": [],
+            }
+
+        faces = face_app.get(img)
+        face_count = len(faces)
+        valid_faces = [f for f in faces if passes_quality_gate(f)]
+
+        face_payloads: List[Dict[str, Any]] = []
+        for face in valid_faces:
+            quality = compute_face_quality(face, img, face_count)
+            box = face.bbox.astype(int).tolist()
+            face_payloads.append({
+                "box": {"x": box[0], "y": box[1], "width": box[2] - box[0], "height": box[3] - box[1]},
+                "score": float(face.det_score),
+                "quality": quality,
+                "pose": {"pitch": quality["pitch"], "yaw": quality["yaw"], "roll": quality["roll"]},
+                "enrollment_issues": enrollment_issues(quality),
+            })
+
+        if not valid_faces:
+            return {
+                "face_detected": face_count > 0,
+                "face_count": face_count,
+                "quality": 0.0,
+                "issues": ["Лицо не обнаружено или слишком низкого качества"] if face_count > 0 else ["Лицо не обнаружено"],
+                "faces": [],
+            }
+
+        # Первичное лицо = крупнейшее по площади бокса среди валидных.
+        primary = max(valid_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        primary_quality = compute_face_quality(primary, img, face_count)
+        issues = enrollment_issues(primary_quality)
+        if face_count > ENROLL_MAX_FACES:
+            issues.append("Обнаружено несколько лиц в кадре")
+
+        return {
+            "face_detected": True,
+            "face_count": face_count,
+            "quality": primary_quality["score"],
+            "issues": issues,
+            "enrollment_ok": len(issues) == 0,
+            "primary": {
+                "score": float(primary.det_score),
+                "quality": primary_quality,
+            },
+            "faces": face_payloads,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Quality assessment error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/get-embedding", dependencies=[Depends(verify_api_key)])
-async def get_embedding(image: UploadFile = File(...)):
-    """Extracts face embedding from image. Applies quality gate."""
+async def get_embedding(
+    image: UploadFile = File(...),
+    strict: Optional[bool] = False,
+):
+    """
+    Extracts face embedding from image.
+
+    - strict=false (по умолчанию): МЯГКИЙ путь для живого распознавания —
+      ворота по det_score/размеру, но вектор тянется даже из неидеального кадра.
+    - strict=true: ЖЁСТКИЙ путь для ЗАПИСИ референсного эмбеддинга —
+      мусорные кадры (размытие, критический наклон, темнота, несколько лиц)
+      отклоняются с перечислением причин в issues.
+    """
     try:
         image_bytes = await image.read()
         img = load_image_from_bytes(image_bytes)
@@ -476,16 +774,36 @@ async def get_embedding(image: UploadFile = File(...)):
 
         faces = face_app.get(img)
         if not faces:
-            return {"descriptor": None, "error": "No face detected"}
+            return {"descriptor": None, "error": "No face detected", "quality": None, "issues": ["Лицо не обнаружено"]}
 
         face = faces[0]
         if not passes_quality_gate(face):
-            return {"descriptor": None, "error": "Low quality face"}
+            return {"descriptor": None, "error": "Low quality face", "quality": None, "issues": ["Низкое качество детекции лица"]}
+
+        face_count = len(faces)
+        quality = compute_face_quality(face, img, face_count)
+
+        if strict:
+            issues = enrollment_issues(quality)
+            if issues:
+                logger.info(f"Enrollment gate REJECTED: {issues} (score={quality['score']})")
+                return {
+                    "descriptor": None,
+                    "error": "Enrollment quality gate failed",
+                    "quality": quality,
+                    "issues": issues,
+                    "passed": False,
+                }
 
         if not hasattr(face, "embedding") or face.embedding is None:
-            return {"descriptor": None, "error": "Failed to extract embedding"}
+            return {"descriptor": None, "error": "Failed to extract embedding", "quality": quality, "issues": []}
 
-        return {"descriptor": face.embedding.tolist()}
+        return {
+            "descriptor": face.embedding.tolist(),
+            "quality": quality,
+            "issues": [],
+            "passed": True,
+        }
     except HTTPException:
         raise
     except Exception as e:

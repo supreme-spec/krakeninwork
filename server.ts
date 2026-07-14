@@ -19,6 +19,7 @@ import {
   detectFaces,
   detectFacesFast,
   getEmbedding,
+  extractEmbedding,
   registerPerson as registerFacePerson,
   registerPersonFromDescriptor,
   unregisterPerson as unregisterFacePerson,
@@ -1154,7 +1155,7 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
         let personId: number;
         if (existingPerson) {
           personId = existingPerson.id;
-          const regResult = await registerFacePerson(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
           const isPrimary = existingPerson.photos.length === 0;
           await prisma.personPhoto.create({
             data: { person_id: personId, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
@@ -1171,7 +1172,7 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
             data: { name: cleanName, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
           });
           personId = newPerson.id;
-          const regResult = await registerFacePerson(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
           await prisma.personPhoto.create({
             data: { person_id: personId, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
           });
@@ -1223,7 +1224,7 @@ app.post(["/api/persons/:id/photos", "/api/persons/:id/photos/"], upload.any(), 
     for (const f of files) {
       const photo_path = `photos/${f.filename}`;
       const fullPath = path.join(publicDir, photo_path);
-      const regResult = await registerFacePerson(person.id, person.name, person.category, photo_path, fullPath);
+      const regResult = await enrollPhotoWithGate(person.id, person.name, person.category, photo_path, fullPath);
       const isPrimary = person.photos.length === 0;
       await prisma.personPhoto.create({
         data: { person_id: id, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
@@ -1388,6 +1389,10 @@ app.post(["/api/persons/:id/photos/:photoId/set_primary", "/api/persons/:id/phot
 });
 
 // ── FAILED EMBEDDINGS ──
+// Коллектор «мусорных» кадров, отклонённых воротами качества при ЗАПИСИ
+// референсного эмбеддинга (размытие / наклон головы / темнота / несколько лиц).
+// Стартовые записи — демо-примеры категорий; реальные отказы добавляются
+// функцией recordFailedEmbedding при загрузке/импорте фото.
 let failedEmbeddings = [
   {
     id: 1,
@@ -1430,6 +1435,73 @@ let failedEmbeddings = [
     resolution: "1280x720"
   }
 ];
+let failedEmbeddingsNextId = 5;
+
+/**
+ * Регистрирует отклонённый кадр в коллекторе «мусорных снимков».
+ * Используется, когда ворота качества (strict) отклонили фото при записи
+ * референсного эмбеддинга — кадр НЕ попадает в БД, но попадает в панель
+ * «Мусорные кадры» с реальной причиной (размытие / угол / темнота /多人).
+ */
+async function recordFailedEmbedding(opts: {
+  photo_path: string;
+  filename: string;
+  reason: string;
+  detected_faces?: number;
+  quality_score?: number;
+  resolution?: string;
+}): Promise<void> {
+  try {
+    const resolution = opts.resolution || (await sharp(path.join(publicDir, opts.photo_path)).metadata()
+      .then((m) => `${m.width ?? "?"}x${m.height ?? "?"}`).catch(() => "unknown"));
+    failedEmbeddings.unshift({
+      id: failedEmbeddingsNextId++,
+      photo_path: opts.photo_path,
+      filename: opts.filename,
+      reason: opts.reason,
+      detected_faces: opts.detected_faces ?? 1,
+      quality_score: opts.quality_score ?? 0,
+      resolution,
+      created_at: new Date().toISOString(),
+    });
+    // Ограничиваем размер коллектора, чтобы не есть память (оставляем свежие 200).
+    if (failedEmbeddings.length > 200) failedEmbeddings.length = 200;
+    logInfo(`Мусорный кадр отклонён воротами: ${opts.reason} (${opts.filename})`);
+  } catch (e) {
+    logError(e as Error, { context: "recordFailedEmbedding", filename: opts.filename });
+  }
+}
+
+/**
+ * Записывает референсный эмбеддинг с ЖЁСТКИМ воротом качества.
+ * Если кадр — мусор (размытие/наклон/темнота/несколько лиц) или лицо не
+ * найдено, эмбеддинг НЕ сохраняется, а кадр попадает в коллектор failedEmbeddings.
+ * Возвращает признак успешности, как registerPerson.
+ */
+async function enrollPhotoWithGate(
+  personId: number,
+  personName: string,
+  category: string,
+  photo_path: string,
+  fullPath: string
+): Promise<{ hasEmbedding: boolean; error?: string }> {
+  const ext = await extractEmbedding(fullPath, { strict: true });
+
+  if (!ext.passed || !ext.descriptor) {
+    const q = ext.quality;
+    await recordFailedEmbedding({
+      photo_path,
+      filename: path.basename(photo_path),
+      reason: ext.issues.length ? ext.issues.join("; ") : (ext.error || "Лицо не обнаружено на фото"),
+      detected_faces: q?.face_count ?? 0,
+      quality_score: q?.score ?? 0,
+    });
+    return { hasEmbedding: false, error: ext.issues.join("; ") || ext.error };
+  }
+
+  const reg = await registerPersonFromDescriptor(personId, personName, category, photo_path, ext.descriptor);
+  return { hasEmbedding: reg.hasEmbedding, error: reg.error };
+}
 
 app.get(["/api/failed_embeddings", "/api/failed_embeddings/"], (req, res) => {
   res.json(failedEmbeddings);
@@ -3456,6 +3528,15 @@ async function start() {
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
+    });
+  } else {
+    // В dev UI живёт на Vite (:5173), а :3000 — только API/WS. Чтобы открытие
+    // http://localhost:3000 в браузере не отдавало 404, перенаправляем обычную
+    // навигацию на Vite. /api и /ws обрабатываются выше и сюда не попадают.
+    const VITE_DEV_URL = process.env.VITE_DEV_URL || `http://localhost:5173`;
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api") || req.path.startsWith("/ws")) return next();
+      res.redirect(302, VITE_DEV_URL + req.originalUrl);
     });
   }
 

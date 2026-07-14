@@ -95,16 +95,6 @@ export default function TopBar({
         </div>
       </div>
 
-      {/* Center: slogan — только на компьютере (с мышью), не на телефоне/планшете */}
-      <div className="slogan-desktop-only absolute left-[38%] -translate-x-1/2 flex-col items-center leading-none select-none pointer-events-none gap-0.5">
-        <span className="text-kraken-muted text-[9px] tracking-[0.18em] uppercase font-medium">
-          Невидимое управляет хаосом.
-        </span>
-        <span className="text-kraken-muted text-[9px] tracking-[0.18em] uppercase font-medium">
-          Мы делаем его видимым.
-        </span>
-      </div>
-
       {/* Right: release button + bell + user */}
       <div className="flex items-center gap-2">
         {releaseButton && (

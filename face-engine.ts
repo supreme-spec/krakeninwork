@@ -585,13 +585,24 @@ async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Pro
  * Получает эмбеддинг с Python-сервера.
  * Blob создаётся из Uint8Array (совместимо с node-fetch v3).
  */
-async function getEmbeddingFromServer(imageBuffer: Buffer): Promise<Float32Array | null> {
+/**
+ * Получает эмбеддинг с Python-сервера.
+ * Blob создаётся из Uint8Array (совместимо с node-fetch v3).
+ *
+ * @param strict — true для ЖЁСТКОГО ворота записи (enrollment): мусорные кадры
+ *   (размытие/наклон/темнота/несколько лиц) отклоняются с перечислением причин.
+ */
+async function getEmbeddingFromServer(
+  imageBuffer: Buffer,
+  strict: boolean = false
+): Promise<{ descriptor: Float32Array | null; quality: any | null; issues: string[]; passed: boolean; error?: string }> {
   try {
     const formData = new FormData();
     // Конвертируем Buffer в Uint8Array для Blob
     const uint8Array = new Uint8Array(imageBuffer);
     const blob = new Blob([uint8Array], { type: "image/jpeg" });
     formData.append("image", blob as any, "image.jpg");
+    if (strict) formData.append("strict", "true");
 
     const response = await apiFetchWithKey(`${FACE_SERVER_URL}/get-embedding`, {
       method: "POST",
@@ -602,14 +613,50 @@ async function getEmbeddingFromServer(imageBuffer: Buffer): Promise<Float32Array
       throw new Error(`Server responded with status: ${response.status}`);
     }
 
-    const result = await response.json() as { descriptor?: number[] };
+    const result = await response.json() as {
+      descriptor?: number[];
+      quality?: any;
+      issues?: string[];
+      passed?: boolean;
+      error?: string;
+    };
 
-    if (result.descriptor) {
-      return new Float32Array(result.descriptor);
-    }
-    return null;
+    return {
+      descriptor: result.descriptor ? new Float32Array(result.descriptor) : null,
+      quality: result.quality ?? null,
+      issues: result.issues ?? [],
+      passed: result.passed ?? (result.descriptor ? true : false),
+      error: result.error,
+    };
   } catch (e) {
     logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    return { descriptor: null, quality: null, issues: [], passed: false, error: (e as Error).message };
+  }
+}
+
+/**
+ * Полная оценка качества кадра через /assess-quality (резкость, поза, яркость,
+ * количество лиц) для решения о пригодности к извлечению эмбеддинга.
+ */
+async function assessQualityFromServer(imageBuffer: Buffer): Promise<any | null> {
+  try {
+    const formData = new FormData();
+    const uint8Array = new Uint8Array(imageBuffer);
+    const blob = new Blob([uint8Array], { type: "image/jpeg" });
+    formData.append("image", blob as any, "image.jpg");
+
+    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/assess-quality`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Server responded with status: ${response.status}`);
+    }
+
+    return await response.json();
+  } catch (e) {
+    logError(e as Error, { context: "Оценка качества с Python-сервера" });
     return null;
   }
 }
@@ -796,10 +843,70 @@ export async function getEmbedding(
       imgBuffer = imagePathOrBuffer;
     }
 
-    return await getEmbeddingFromServer(imgBuffer);
+    // Мягкий путь (strict=false) — для живого распознавания: вектор тянется
+    // даже из неидеального кадра. Возвращаем только дескриптор.
+    const res = await getEmbeddingFromServer(imgBuffer, false);
+    return res.descriptor;
   } catch (err) {
     logError(err as Error, { context: "Получение эмбеддинга" });
     return null;
+  }
+}
+
+/**
+ * Извлекает эмбеддинг с ПОЛНОЙ оценкой качества.
+ *
+ * Для ЗАПИСИ референсного эмбеддинга (регистрация/обучение) используйте
+ * `strict: true` — кадр пройдёт жёсткий ворот (резкость/поза/яркость/число лиц),
+ * и при провале `passed` будет false, а `descriptor` — null. Garbage-кадры
+ * таким образом НЕ попадают в БД.
+ */
+export async function extractEmbedding(
+  imagePathOrBuffer: string | Buffer,
+  options: { strict?: boolean } = {}
+): Promise<{
+  descriptor: Float32Array | null;
+  quality: any | null;
+  issues: string[];
+  passed: boolean;
+  error?: string;
+}> {
+  const strict = options.strict ?? false;
+
+  const healthy = await ensurePythonServerAvailable();
+  if (!healthy) {
+    return {
+      descriptor: null,
+      quality: null,
+      issues: ["Сервис распознавания лиц недоступен"],
+      passed: false,
+      error: "Python-сервер недоступен",
+    };
+  }
+
+  try {
+    let imgBuffer: Buffer;
+
+    if (typeof imagePathOrBuffer === "string") {
+      const resolvedPath = safeResolvePhotoPath(imagePathOrBuffer);
+      if (!resolvedPath) {
+        return {
+          descriptor: null,
+          quality: null,
+          issues: ["Недопустимый путь к файлу"],
+          passed: false,
+          error: "Недопустимый путь к файлу",
+        };
+      }
+      imgBuffer = await fs.promises.readFile(resolvedPath);
+    } else {
+      imgBuffer = imagePathOrBuffer;
+    }
+
+    return await getEmbeddingFromServer(imgBuffer, strict);
+  } catch (err) {
+    logError(err as Error, { context: "Извлечение эмбеддинга (strict)" });
+    return { descriptor: null, quality: null, issues: [], passed: false, error: (err as Error).message };
   }
 }
 
@@ -824,10 +931,13 @@ export async function registerPerson(
   }
 
   try {
-    const descriptor = await getEmbedding(imagePathOrBuffer);
+    // Жёсткий ворот при записи референсного эмбеддинга: мусорные кадры
+    // (размытие/наклон/темнота/несколько лиц) отклоняются ДО сохранения в БД.
+    const { descriptor, issues, error } = await extractEmbedding(imagePathOrBuffer, { strict: true });
 
-    if (!descriptor) {
-      return { success: false, hasEmbedding: false, error: "Лицо не обнаружено на фото" };
+    if (!descriptor || issues.length > 0) {
+      const reason = issues.length > 0 ? issues.join("; ") : (error || "Лицо не обнаружено на фото");
+      return { success: false, hasEmbedding: false, error: reason };
     }
 
     // Удаляем старый дескриптор с тем же фото
@@ -982,7 +1092,7 @@ export async function searchByPhoto(
         descriptor = cached.descriptor;
       } else {
         const imgBuffer = await fs.promises.readFile(resolvedPath);
-        descriptor = await getEmbeddingFromServer(imgBuffer);
+        descriptor = (await getEmbeddingFromServer(imgBuffer, false)).descriptor;
 
         // Сохраняем в кэш
         if (descriptor) {
@@ -994,7 +1104,7 @@ export async function searchByPhoto(
         }
       }
     } else {
-      descriptor = await getEmbeddingFromServer(imagePathOrBuffer);
+      descriptor = (await getEmbeddingFromServer(imagePathOrBuffer, false)).descriptor;
     }
 
     if (!descriptor) {
@@ -1070,24 +1180,58 @@ export async function assessPhotoQuality(
   }
 
   try {
-    const faces = await detectFaces(imagePathOrBuffer, { maxFaces: 5, minConfidence: 0.2 });
-    if (faces.length > 0) {
-      return {
-        faceDetected: true,
-        faceCount: faces.length,
-        quality: 0.8,
-        issues: [],
-        details: { detScore: faces[0].score },
-      };
+    let imgBuffer: Buffer;
+
+    if (typeof imagePathOrBuffer === "string") {
+      const resolvedPath = safeResolvePhotoPath(imagePathOrBuffer);
+      if (!resolvedPath) {
+        return {
+          faceDetected: false,
+          faceCount: 0,
+          quality: 0,
+          issues: ["Недопустимый путь к файлу"],
+          details: null,
+        };
+      }
+      imgBuffer = await fs.promises.readFile(resolvedPath);
     } else {
+      imgBuffer = imagePathOrBuffer;
+    }
+
+    // Реальная оценка качества (резкость, поза, яркость, число лиц) с сервера.
+    const res = await assessQualityFromServer(imgBuffer);
+    if (!res) {
       return {
         faceDetected: false,
         faceCount: 0,
         quality: 0,
-        issues: ["No face detected"],
+        issues: ["Сервис распознавания недоступен"],
         details: null,
       };
     }
+
+    const primary = res.primary?.quality ?? null;
+    const details = primary
+      ? {
+          detScore: res.primary.score,
+          sharpness: primary.sharpness,
+          sharpness_score: primary.sharpness_score,
+          brightness: primary.brightness,
+          approx_lux: primary.approx_lux,
+          pitch: primary.pitch,
+          yaw: primary.yaw,
+          roll: primary.roll,
+          face_count: res.face_count,
+        }
+      : null;
+
+    return {
+      faceDetected: res.face_detected,
+      faceCount: res.face_count,
+      quality: res.quality,
+      issues: res.issues || [],
+      details,
+    };
   } catch (err) {
     logError(err as Error, { context: "Оценка качества" });
     return {

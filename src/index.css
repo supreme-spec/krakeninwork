@@ -172,15 +172,3 @@ body {
   color: #3dd68c;
   font-weight: 600;
 }
-
-/* Слоган показываем только на компьютере (устройство с мышью / точным
-   указателем). На телефонах и планшетах (сенсорный ввод) скрываем
-   независимо от ширины экрана. */
-.slogan-desktop-only {
-  display: none;
-}
-@media (hover: hover) and (pointer: fine) {
-  .slogan-desktop-only {
-    display: flex;
-  }
-}
