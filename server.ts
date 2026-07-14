@@ -1313,7 +1313,16 @@ app.post(["/api/persons/search_by_photo", "/api/persons/search_by_photo/"], uplo
       face_detected: qualityResult.faceDetected,
       face_count: qualityResult.faceCount,
       det_score: qualityResult.details?.detScore || 0,
-      quality_scores: [qualityResult.quality],
+      quality_scores: qualityResult.details
+        ? [
+            {
+              total: qualityResult.quality,
+              size: qualityResult.details.detScore || 0,
+              blur: qualityResult.details.sharpness || 0,
+              angle: qualityResult.details.yaw || 0,
+            },
+          ]
+        : [],
       faces: faces.map(f => ({ box: f.box, score: f.score })),
       message: formattedMatches.length > 0
         ? `Найдено совпадений: ${formattedMatches.length}`
