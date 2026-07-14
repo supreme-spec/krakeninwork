@@ -21,10 +21,26 @@ prisma/*.db-journal
 prisma/*.db-shm
 prisma/*.db-wal
 
-# Рантайм-медиа, создаваемые конвейером камер (не коммитим)
-public/photos/unknown_*
+# Рантайм-медиа: фото/видео пользователя и камер — не коммитим
+public/photos/
+public/snapshots/
 public/recordings/
-public/snapshots/cam*
+public/confirmations/
+!public/photos/.gitkeep
+!public/snapshots/.gitkeep
+!public/recordings/.gitkeep
+!public/confirmations/.gitkeep
+
+# Видеофайлы (любые)
+*.mp4
+*.webm
+*.mov
+*.avi
+*.mkv
+
+# Прочие локальные артефакты
+_remote_face_server.py
+test_cyr.pdf
 
 /src/generated/prisma
 
