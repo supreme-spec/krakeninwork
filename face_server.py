@@ -34,6 +34,8 @@ MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "40"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.6"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.45"))
+CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "0.55"))
+LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "0.40"))
 # Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
@@ -857,11 +859,22 @@ async def recognize(
         effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
 
         matches: List[Dict[str, Any]] = []
+        needs_confirmation_data = None
+
         for candidate in candidates:
             person = candidate["person"]
             sim = float(candidate["score"])
 
             if category and person.get("category") != category:
+                continue
+
+            if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
+                needs_confirmation_data = {
+                    "person_id": person["person_id"],
+                    "person_name": person["person_name"],
+                    "similarity": sim,
+                    "photo_path": person.get("photo_path", ""),
+                }
                 continue
 
             if sim < effective_threshold:
@@ -881,11 +894,16 @@ async def recognize(
 
         matches.sort(key=lambda x: x["similarity"], reverse=True)
 
-        return {
+        response = {
             "matches": matches[:top_k],
-            "status": "ok",
+            "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
         }
+
+        if needs_confirmation_data and not matches:
+            response["confirmation_candidate"] = needs_confirmation_data
+
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -928,11 +946,22 @@ async def recognize_by_descriptor(
         effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
 
         matches: List[Dict[str, Any]] = []
+        needs_confirmation_data = None
+
         for candidate in candidates:
             person = candidate["person"]
             sim = float(candidate["score"])
 
             if category and person.get("category") != category:
+                continue
+
+            if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
+                needs_confirmation_data = {
+                    "person_id": person["person_id"],
+                    "person_name": person["person_name"],
+                    "similarity": sim,
+                    "photo_path": person.get("photo_path", ""),
+                }
                 continue
 
             if sim < effective_threshold:
@@ -952,11 +981,16 @@ async def recognize_by_descriptor(
 
         matches.sort(key=lambda x: x["similarity"], reverse=True)
 
-        return {
+        response = {
             "matches": matches[:top_k],
-            "status": "ok",
+            "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
         }
+
+        if needs_confirmation_data and not matches:
+            response["confirmation_candidate"] = needs_confirmation_data
+
+        return response
     except HTTPException:
         raise
     except Exception as e:
