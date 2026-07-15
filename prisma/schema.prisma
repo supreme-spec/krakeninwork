@@ -138,6 +138,7 @@ model Event {
   created_at                  DateTime  @default(now())
   needs_operator_confirmation Boolean   @default(false)
   confirmation_status         String?
+  confirmation_id             Int?      // links to face_confirmations.id when this event was created from an operator-confirmation request
 
   camera                      Camera    @relation(fields: [camera_id], references: [id], onDelete: Cascade)
   person                      Person?   @relation(fields: [person_id], references: [id], onDelete: SetNull)
@@ -145,6 +146,7 @@ model Event {
   @@index([camera_id])
   @@index([person_id])
   @@index([created_at])
+  @@index([confirmation_id])
 }
 
 model Recording {

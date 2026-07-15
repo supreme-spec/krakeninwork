@@ -1602,6 +1602,12 @@ app.post(["/api/confirmations/:id/approve", "/api/confirmations/:id/approve/"], 
       data: { status: "APPROVED", confirmed_at: new Date(), confirmed_by: operator_id },
     });
 
+    // Закрываем связанное событие в ленте (снимаем ожидание подтверждения)
+    await prisma.event.updateMany({
+      where: { confirmation_id: id, confirmation_status: "pending" },
+      data: { confirmation_status: "confirmed" },
+    });
+
     // Временное фото уже скопировано в photos/ — удаляем оригинал из confirmations/
     try { await fs.promises.unlink(tempFull); } catch { /* ignore */ }
 
@@ -1658,6 +1664,12 @@ app.post(["/api/confirmations/:id/reject", "/api/confirmations/:id/reject/"], as
     await prisma.faceConfirmation.update({
       where: { id },
       data: { status: "REJECTED", rejected_reason: reason, confirmed_at: new Date(), confirmed_by: operator_id },
+    });
+
+    // Закрываем связанное событие в ленте (снимаем ожидание подтверждения)
+    await prisma.event.updateMany({
+      where: { confirmation_id: id, confirmation_status: "pending" },
+      data: { confirmation_status: "rejected" },
     });
 
     broadcastSecurity({ type: "CONFIRMATION_RESOLVED", confirmation_id: id, status: "REJECTED", person_id: conf.person_id, new_person_id: newPersonId });
@@ -1729,6 +1741,8 @@ app.post(["/api/events/:id/reject", "/api/events/:id/reject/"], async (req, res)
     const event = await prisma.event.findUnique({ where: { id } });
     if (!event) return res.status(404).json({ detail: "Event not found" });
 
+    const linkedConfirmationId = event.confirmation_id ?? null;
+
     // Delete snapshot from disk
     if (event.snapshot_path) {
       const fullPath = path.join(publicDir, event.snapshot_path);
@@ -1740,6 +1754,15 @@ app.post(["/api/events/:id/reject", "/api/events/:id/reject/"], async (req, res)
     }
 
     await prisma.event.delete({ where: { id } });
+
+    // Закрываем связанный запрос подтверждения, иначе он навсегда останется PENDING
+    if (linkedConfirmationId) {
+      await prisma.faceConfirmation.updateMany({
+        where: { id: linkedConfirmationId, status: "PENDING" },
+        data: { status: "REJECTED", rejected_reason: "Отклонено из ленты событий", confirmed_at: new Date() },
+      });
+    }
+
     broadcastSecurity({ type: "EVENT" });
     res.json({ ok: true, message: "Событие и снапшот удалены" });
   } catch (err) {
@@ -2681,6 +2704,7 @@ async function persistAndBroadcastEvent(e: {
   person_photo_path?: string;
   needs_operator_confirmation?: boolean;
   confirmation_status?: string;
+  confirmationId?: number;
 }) {
   try {
     await prisma.event.create({
@@ -2696,6 +2720,7 @@ async function persistAndBroadcastEvent(e: {
         person_photo_path: e.person_photo_path,
         needs_operator_confirmation: e.needs_operator_confirmation ?? false,
         confirmation_status: e.confirmation_status ?? null,
+        confirmation_id: e.confirmationId ?? null,
       },
     });
     broadcastSecurity({
@@ -3068,6 +3093,7 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       person_photo_path: existing_photo_path,
       needs_operator_confirmation: true,
       confirmation_status: "pending",
+      confirmationId: confirmation.id,
     });
 
     // Уведомление оператору через Security WebSocket

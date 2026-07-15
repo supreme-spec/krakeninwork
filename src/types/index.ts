@@ -88,6 +88,7 @@ export interface KrakenEvent {
   created_at: string
   needs_operator_confirmation?: boolean
   confirmation_status?: 'pending' | 'confirmed' | 'rejected'
+  confirmation_id?: number
 }
 
 export interface FaceDetection {
