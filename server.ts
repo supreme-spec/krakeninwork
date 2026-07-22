@@ -531,6 +531,28 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
     }
 
     if (matchedPerson) {
+      if (isIgnoredCategory(matchedPerson.category)) {
+        logDebug(`[UNV ${camera.id}] Игнорируем ${matchedPerson.category}: ${matchedPerson.name}`);
+        responseSent = true;
+        res.json({ success: true, camera_id: camera.id, processed: true, ignored: true });
+        return;
+      }
+
+      if (isPersonInCurrentVisitWindow(matchedPerson.id)) {
+        logDebug(`[UNV ${camera.id}] ${matchedPerson.name} уже был в этом окне визита (с 21:00), событие не создаётся`);
+        responseSent = true;
+        res.json({ success: true, camera_id: camera.id, processed: true, duplicate_window: true });
+        return;
+      }
+
+      await maybeRecordVisit(camera, matchedPerson.id, {
+        personId: matchedPerson.id,
+        personName: matchedPerson.name,
+        category: matchedPerson.category,
+        photoPath: matchedPerson.photo_path,
+        similarity: confidence || 0.85,
+      });
+
       await prisma.person.update({
         where: { id: matchedPerson.id },
         data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
@@ -538,7 +560,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
       const idx = persons.findIndex((p) => p.id === matchedPerson.id);
       if (idx >= 0) { persons[idx].visit_count++; persons[idx].last_seen_at = new Date().toISOString(); }
 
-      let event_type = "RECOGNIZED";
+      let event_type = "VISIT";
       if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
       else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
       else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
@@ -2935,6 +2957,16 @@ function triggerSmartRecording(cam: any) {
 }
 
 async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) {
+  if (isIgnoredCategory(match.category)) {
+    logDebug(`[Камера ${cam.id}] Игнорируем ${match.category}: ${match.personName}`);
+    return;
+  }
+
+  if (isPersonInCurrentVisitWindow(match.personId)) {
+    logDebug(`[Камера ${cam.id}] ${match.personName} уже был в этом окне визита (с 21:00), событие не создаётся`);
+    return;
+  }
+
   let event_type = "RECOGNIZED";
   if (match.category === "VIP") event_type = "VIP_ARRIVAL";
   else if (match.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
@@ -3171,9 +3203,11 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const w = box.width || 0;
     const h = box.height || 0;
     const bbox: [number, number, number, number] = [x, y, x + w, y + h];
+
+    if (h < VISIT_MIN_FACE_SIZE_PX) continue;
+
     const desc = f.descriptor;
 
-    // Ищем до НИЖНЕГО порога бэнда, чтобы поймать кандидатов 40-55% (подтверждение)
     let match: any = null;
     if (desc && desc.length) {
       const matches = await searchByDescriptor(desc, minThreshold, 1);
@@ -3182,7 +3216,36 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const sim = match ? match.similarity : 0;
 
     if (match && sim >= confirmT) {
-      // Уверенное совпадение (>= confirmation_threshold) → авто-распознано
+      if (isIgnoredCategory(match.category)) {
+        enriched.push({
+          track_id: i + 1,
+          bbox,
+          person_id: match.personId,
+          person_name: match.personName,
+          category: match.category,
+          confidence: sim,
+          box: f.box,
+          is_ignored: true,
+        });
+        continue;
+      }
+
+      if (isPersonInCurrentVisitWindow(match.personId)) {
+        enriched.push({
+          track_id: i + 1,
+          bbox,
+          person_id: match.personId,
+          person_name: match.personName,
+          category: match.category,
+          confidence: sim,
+          box: f.box,
+          is_cooldown: true,
+        });
+        continue;
+      }
+
+      await maybeRecordVisit(cam, match.personId, match, frameBase64);
+
       enriched.push({
         track_id: i + 1,
         bbox,
@@ -3192,13 +3255,22 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         confidence: sim,
         box: f.box,
       });
-      const key = `${cam.id}:p${match.personId}`;
-      if (Date.now() - (lastEventAt.get(key) || 0) > RECOGNIZED_DEBOUNCE_MS) {
-        lastEventAt.set(key, Date.now());
-        await handleRecognizedEvent(cam, match, frameBase64);
-      }
     } else if (match && sim >= minThreshold) {
-      // БЭНД ПОДТВЕРЖДЕНИЯ ОПЕРАТОРА (low_threshold .. confirmation_threshold)
+      if (isIgnoredCategory(match.category)) {
+        enriched.push({
+          track_id: i + 1,
+          bbox,
+          person_id: match.personId,
+          person_name: match.personName,
+          category: match.category,
+          confidence: sim,
+          box: f.box,
+          needs_confirmation: true,
+          is_ignored: true,
+        });
+        continue;
+      }
+
       enriched.push({
         track_id: i + 1,
         bbox,
@@ -3215,6 +3287,23 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
         await handleConfirmationEvent(cam, match, frameBase64, f);
       }
     } else {
+      const faceHash = Buffer.from(JSON.stringify(f.descriptor || [])).toString("base64").slice(0, 64);
+      const unknownCooldown = unknownFaceCooldowns.get(faceHash);
+      const now = Date.now();
+      if (unknownCooldown && now - unknownCooldown < UNKNOWN_COOLDOWN_MS) {
+        enriched.push({
+          track_id: i + 1,
+          bbox,
+          person_id: undefined,
+          category: "UNKNOWN",
+          confidence: 0,
+          detection_score: f.score,
+          box: f.box,
+          is_duplicate_unknown: true,
+        });
+        continue;
+      }
+
       enriched.push({
         track_id: i + 1,
         bbox,
@@ -3227,11 +3316,18 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
       const key = `${cam.id}:unknown`;
       if (Date.now() - (lastEventAt.get(key) || 0) > UNKNOWN_DEBOUNCE_MS) {
         lastEventAt.set(key, Date.now());
+        unknownFaceCooldowns.set(faceHash, now);
         await handleUnknownEvent(cam, frameBase64, f);
       }
     }
   }
   return enriched;
+}
+
+function isIgnoredCategory(category: string | undefined): boolean {
+  if (!category) return false;
+  const ignored = ['SECURITY', 'ОХРАНА', 'PERSONNEL', 'GUARD'];
+  return ignored.includes(category.toUpperCase());
 }
 
 // Подтверждения оператора: дебаунс создания pending-записей + папка временных фото
@@ -3323,6 +3419,52 @@ const cameraFfmpegFailCount = new Map<number, number>();
 const cameraWebhookFallback = new Map<number, boolean>();
 // Отложенные таймеры перезапуска FFmpeg (чтобы их можно было отменить при остановке пайплайна)
 const cameraRestartTimers = new Map<number, NodeJS.Timeout>();
+
+// Visit-day: 24-часовое окно с 21:00 до 21:00
+const VISIT_DAY_START_HOUR = 21;
+const personLastVisitWindow = new Map<number, number>();
+const unknownFaceCooldowns = new Map<string, number>();
+const UNKNOWN_COOLDOWN_MS = 3 * 60 * 60 * 1000;
+const VISIT_MIN_FACE_SIZE_PX = 120;
+
+function getVisitWindowStart(now: Date): number {
+  const windowStart = new Date(now);
+  if (now.getHours() >= VISIT_DAY_START_HOUR) {
+    windowStart.setHours(VISIT_DAY_START_HOUR, 0, 0, 0);
+  } else {
+    windowStart.setDate(now.getDate() - 1);
+    windowStart.setHours(VISIT_DAY_START_HOUR, 0, 0, 0);
+  }
+  return windowStart.getTime();
+}
+
+function isPersonInCurrentVisitWindow(personId: number): boolean {
+  const lastWindowStart = personLastVisitWindow.get(personId);
+  if (lastWindowStart === undefined) return false;
+  return lastWindowStart === getVisitWindowStart(new Date());
+}
+
+async function maybeRecordVisit(cam: any, personId: number, match: any, frameBase64?: string): Promise<void> {
+  if (isPersonInCurrentVisitWindow(personId)) return;
+  const windowStart = getVisitWindowStart(new Date());
+  personLastVisitWindow.set(personId, windowStart);
+
+  const snapshot_path = frameBase64 ? saveSnapshotFromFrame(frameBase64, cam.id, match.personName) : "";
+
+  await persistAndBroadcastEvent({
+    cameraId: cam.id,
+    cameraName: cam.name,
+    personId,
+    event_type: "VISIT",
+    confidence: match.similarity,
+    snapshot_path,
+    person_name: match.personName,
+    person_category: match.category,
+    person_photo_path: match.photoPath,
+  });
+
+  logInfo(`[Камера ${cam.id}] НОВЫЙ ВИЗИТ: ${match.personName} (окно с ${new Date(windowStart).toLocaleString('ru-RU')})`);
+}
 
 wssCamera.on("connection", (ws, req) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
