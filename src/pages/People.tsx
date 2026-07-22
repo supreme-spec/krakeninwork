@@ -77,7 +77,13 @@ export default function People() {
     try {
       const params = new URLSearchParams()
       if (search) params.set('search', search)
-      if (filterCat) params.set('category', filterCat)
+      
+      if (filterCat === 'UNKNOWN') {
+        params.set('name_contains', 'Неизвестный')
+      } else if (filterCat) {
+        params.set('category', filterCat)
+      }
+      
       params.set('sort_by', sortBy)
       params.set('sort_dir', sortDir)
       params.set('limit', '500')  // достаточно для большинства баз
@@ -225,6 +231,7 @@ export default function People() {
           <select value={filterCat} onChange={e => setFilterCat(e.target.value)}
             className="bg-kraken-panel border border-kraken-border text-kraken-text text-sm px-2 py-2 rounded-lg focus:outline-none focus:border-kraken-purple">
             <option value="">Все</option>
+            <option value="UNKNOWN">🕵️ Неизвестные</option>
             {categories.map(c => <option key={c.code} value={c.code}>{c.label}</option>)}
           </select>
           <button onClick={() => { setEditPerson(null); setShowAdd(true) }} className="btn-primary flex items-center gap-1.5 text-sm py-2 px-3 flex-shrink-0">

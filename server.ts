@@ -987,13 +987,18 @@ app.get(["/api/persons", "/api/persons/"], async (req, res) => {
     const sort_dir: "asc" | "desc" = req.query.sort_dir === "asc" ? "asc" : "desc";
 
     const where: any = {};
-    if (category) where.category = category;
-    if (search) {
-      where.OR = [
-        { name: { contains: search, mode: "insensitive" } },
-        { comment: { contains: search, mode: "insensitive" } },
-        { organization: { contains: search, mode: "insensitive" } },
-      ];
+    const nameContains = (req.query.name_contains as string || "").trim();
+    if (nameContains) {
+      where.name = { contains: nameContains, mode: "insensitive" };
+    } else {
+      if (category) where.category = category;
+      if (search) {
+        where.OR = [
+          { name: { contains: search, mode: "insensitive" } },
+          { comment: { contains: search, mode: "insensitive" } },
+          { organization: { contains: search, mode: "insensitive" } },
+        ];
+      }
     }
 
     const personsFromDB = await prisma.person.findMany({
@@ -3138,7 +3143,7 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
     cameraName: cam.name,
     personId,
     event_type: "UNKNOWN",
-    confidence: face?.score || 0.5,
+    confidence: 0,
     snapshot_path,
     person_name: personName || "Неизвестный",
     person_category: personCategory,

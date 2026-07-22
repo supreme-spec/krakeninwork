@@ -173,11 +173,15 @@ export default function Events() {
               </div>
 
               {/* Confidence */}
-              {ev.confidence && (
-                <span className="text-kraken-muted text-sm flex-shrink-0">
-                  {cosineToPercent(ev.confidence)}%
-                </span>
-              )}
+              {ev.event_type !== 'UNKNOWN' && ev.confidence ? (
+                <div className="text-xs text-kraken-purple font-semibold">
+                  Совпадение: {cosineToPercent(ev.confidence)}%
+                </div>
+              ) : ev.event_type === 'UNKNOWN' ? (
+                <div className="text-xs text-kraken-muted">
+                  Лицо обнаружено
+                </div>
+              ) : null}
 
               {/* Operator confirmation actions */}
               {ev.needs_operator_confirmation && (
