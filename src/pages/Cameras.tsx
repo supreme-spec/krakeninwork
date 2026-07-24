@@ -46,8 +46,9 @@ export default function Cameras() {
     try {
       const data = await apiFetch<Camera[]>('/cameras')
       setCameras(data)
-    } catch {}
-    finally { setLoading(false) }
+    } catch (e) {
+      console.error('[Cameras] fetch failed:', e)
+    } finally { setLoading(false) }
   }, [])
 
   useEffect(() => {
@@ -262,6 +263,11 @@ export default function Cameras() {
             {/* Badges */}
             <div className="flex items-center gap-2 flex-wrap text-xs text-kraken-muted">
               <span className="bg-kraken-hover px-2 py-0.5 rounded">{cam.camera_type}</span>
+              {cam.stream_width && cam.stream_height && (
+                <span className="bg-kraken-green/10 text-kraken-green px-2 py-0.5 rounded font-mono text-[10px]" title={`Поток: ${cam.stream_codec || '?'} ${cam.stream_width}x${cam.stream_height} @ ${cam.stream_fps || '?'}fps`}>
+                  {cam.stream_codec === 'hevc' ? 'H.265' : cam.stream_codec === 'h264' ? 'H.264' : cam.stream_codec || ''} {cam.stream_width}x{cam.stream_height}
+                </span>
+              )}
               {cam.brand && <span className="bg-kraken-blue/10 text-kraken-blue px-2 py-0.5 rounded">{cam.brand}</span>}
               {cam.model_name && <span className="bg-kraken-hover px-2 py-0.5 rounded text-kraken-text">{cam.model_name}</span>}
               {cam.zone && <span className="bg-kraken-hover px-2 py-0.5 rounded">{cam.zone}</span>}
@@ -418,6 +424,8 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
   const [useAnalytics, setUseAnalytics] = useState(camera.use_camera_analytics ?? false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
+  const [probing, setProbing] = useState(false)
+  const [probeResult, setProbeResult] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -586,6 +594,48 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
             {testResult && (
               <div className={`text-xs px-2 py-1.5 rounded-lg ${testResult.startsWith('✓') ? 'bg-kraken-green/10 text-kraken-green' : 'bg-kraken-red/10 text-kraken-red'}`}>
                 {testResult}
+              </div>
+            )}
+            {/* Автоопределение параметров потока */}
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <div className="flex flex-col">
+                <span className="text-kraken-text text-[10px] font-semibold">Параметры потока</span>
+                {camera.stream_width && camera.stream_height ? (
+                  <span className="text-[9px] text-kraken-green font-mono">
+                    {camera.stream_codec === 'hevc' ? 'H.265' : camera.stream_codec === 'h264' ? 'H.264' : camera.stream_codec || '?'} {camera.stream_width}x{camera.stream_height} @ {camera.stream_fps || '?'}fps
+                  </span>
+                ) : (
+                  <span className="text-[9px] text-kraken-disabled">Не определено</span>
+                )}
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    setProbing(true)
+                    setProbeResult(null)
+                    const r = await fetch(`/api/cameras/${camera.id}/probe`, { method: 'POST' })
+                    const data = await r.json()
+                    if (data.success) {
+                      setProbeResult(`✓ ${data.codec === 'hevc' ? 'H.265' : data.codec === 'h264' ? 'H.264' : data.codec} ${data.width}x${data.height} @ ${data.fps}fps`)
+                      onSaved()
+                    } else {
+                      setProbeResult(`✗ ${data.detail || 'Не удалось'}`)
+                    }
+                  } catch (e: any) {
+                    setProbeResult(`✗ ${e.message || 'Ошибка'}`)
+                  } finally {
+                    setProbing(false)
+                  }
+                }}
+                disabled={probing}
+                className="text-xs px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 disabled:opacity-50 transition-colors"
+              >
+                {probing ? 'Определение...' : 'Автоопределение'}
+              </button>
+            </div>
+            {probeResult && (
+              <div className={`text-xs px-2 py-1.5 rounded-lg ${probeResult.startsWith('✓') ? 'bg-kraken-green/10 text-kraken-green' : 'bg-kraken-red/10 text-kraken-red'}`}>
+                {probeResult}
               </div>
             )}
           </div>

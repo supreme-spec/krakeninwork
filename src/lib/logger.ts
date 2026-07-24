@@ -29,14 +29,30 @@ function formatLog(level: string, message: string, meta?: any): string {
 
 export function logInfo(message: string, meta?: any): void {
   const log = formatLog("INFO", message, meta);
-  console.info(`[INFO] ${message}`, meta || "");
-  fs.appendFileSync(APP_LOG_PATH, log);
+  try {
+    console.info(`[INFO] ${message}`, meta || "");
+  } catch {
+    // ignore broken pipe on console
+  }
+  try {
+    fs.appendFileSync(APP_LOG_PATH, log);
+  } catch {
+    // ignore broken pipe on log file
+  }
 }
 
 export function logWarn(message: string, meta?: any): void {
   const log = formatLog("WARN", message, meta);
-  console.warn(`[WARN] ${message}`, meta || "");
-  fs.appendFileSync(APP_LOG_PATH, log);
+  try {
+    console.warn(`[WARN] ${message}`, meta || "");
+  } catch {
+    // ignore broken pipe on console
+  }
+  try {
+    fs.appendFileSync(APP_LOG_PATH, log);
+  } catch {
+    // ignore broken pipe on log file
+  }
 }
 
 export function logError(error: Error | string, meta?: any): void {
@@ -46,15 +62,31 @@ export function logError(error: Error | string, meta?: any): void {
     ...meta,
     stack: errorStack,
   });
-  console.error(`[ERROR] ${errorMessage}`, meta || "", errorStack || "");
-  fs.appendFileSync(ERROR_LOG_PATH, log);
+  try {
+    console.error(`[ERROR] ${errorMessage}`, meta || "", errorStack || "");
+  } catch {
+    // ignore broken pipe on console
+  }
+  try {
+    fs.appendFileSync(ERROR_LOG_PATH, log);
+  } catch {
+    // ignore broken pipe on log file
+  }
 }
 
 export function logDebug(message: string, meta?: any): void {
   if (process.env.NODE_ENV === "development") {
     const log = formatLog("DEBUG", message, meta);
-    console.debug(`[DEBUG] ${message}`, meta || "");
-    fs.appendFileSync(APP_LOG_PATH, log);
+    try {
+      console.debug(`[DEBUG] ${message}`, meta || "");
+    } catch {
+      // ignore broken pipe on console
+    }
+    try {
+      fs.appendFileSync(APP_LOG_PATH, log);
+    } catch {
+      // ignore broken pipe on log file
+    }
   }
 }
 

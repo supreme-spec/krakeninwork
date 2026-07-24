@@ -19,6 +19,8 @@ model Camera {
   created_at           DateTime  @default(now())
   status               String    @default("offline")
   roi_zones            String?   // JSON string
+  roi_width            Int?      // Разрешение, при котором нарисованы ROI зоны
+  roi_height           Int?      // (для автомаcштабирования при изменении потока)
   fps                  Int       @default(25)
   ping_ms              Int       @default(0)
   is_smart_recording   Boolean   @default(false)
@@ -29,6 +31,10 @@ model Camera {
   username             String?
   password             String?
   use_camera_analytics Boolean   @default(false)
+  stream_width         Int?      // Реальное разрешение потока (автоопределение)
+  stream_height        Int?      // Реальное разрешение потока (автоопределение)
+  stream_codec         String?   // Кодек потока: h264, hevc/h265, mjpeg, etc.
+  stream_fps           Int?      // Реальный FPS потока
   
   events               Event[]
   recordings           Recording[]

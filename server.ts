@@ -12,6 +12,7 @@ import { promisify } from "util";
 const execAsync = promisify(exec);
 import axios from "axios";
 import sharp from "sharp";
+import iconv from "iconv-lite";
 import { ZipArchive } from "archiver";
 import * as unzipper from "unzipper";
 import ExcelJS from "exceljs";
@@ -38,11 +39,22 @@ import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
 
 // ─── GLOBAL ERROR HANDLERS (catch unhandled rejections/exceptions) ─────────────
+let isHandlingError = false;
 process.on("uncaughtException", (err) => {
+  if (isHandlingError) {
+    // Предотвращаем бесконечный цикл: EPIPE → uncaughtException → logError → EPIPE → ...
+    process.stderr.write(`[FATAL] Recursive error: ${err.message}\n`);
+    return;
+  }
+  isHandlingError = true;
   logError(err as Error, { context: "uncaughtException" });
+  isHandlingError = false;
 });
 process.on("unhandledRejection", (reason: any) => {
+  if (isHandlingError) return;
+  isHandlingError = true;
   logError(new Error(String(reason)), { context: "unhandledRejection" });
+  isHandlingError = false;
 });
 
 // ── __filename / __dirname ────────────────────────────────────────────────────
@@ -95,11 +107,19 @@ app.use((req, res, next) => {
       logUrl = lower.replace(regex, "$1[REDACTED]");
     });
   }
-  logInfo(`${req.method} ${logUrl}`, { ip: req.ip });
+  // Пропускаем шумные polling-эндпоинты
+  const isPolling = /^\/api\/(cameras|events|health|persons\/?$|diagnose)/.test(req.path);
+  
+  if (!isPolling) {
+    logInfo(`${req.method} ${logUrl}`, { ip: req.ip });
+  }
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    logInfo(`${req.method} ${logUrl} ${res.statusCode}`, { duration: `${duration}ms` });
+    // Для polling логируем только ошибки (не 2xx/3xx)
+    if (!isPolling || res.statusCode >= 400) {
+      logInfo(`${req.method} ${logUrl} ${res.statusCode}`, { duration: `${duration}ms` });
+    }
   });
 
   next();
@@ -147,14 +167,8 @@ function getCameraConfig(ip: string): any | null {
 }
 
 const ALLOWED_CAMERA_IPS = new Set<string>([
-  // Uniview
-  '192.168.1.50',
-  '192.168.1.51',
-  '192.168.1.52',
-  // Hikvision
-  '192.168.1.60',
-  '192.168.1.61',
-  '192.168.1.62',
+  '192.168.10.197',
+  '192.168.100.155',
 ]);
 
 const webhookCooldown = new Map<string, number>();
@@ -392,7 +406,26 @@ function parseRoiZones(cam: any): any[] {
   try {
     if (!cam.roi_zones) return [];
     const parsed = JSON.parse(cam.roi_zones);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    
+    // Масштабируем ROI под выходное разрешение FFmpeg (может отличаться от потока)
+    const out = getStreamResolution(cam);
+    const roiW = cam.roi_width || 0;
+    const roiH = cam.roi_height || 0;
+    
+    if (roiW && roiH && (out.width !== roiW || out.height !== roiH)) {
+      const scaleX = out.width / roiW;
+      const scaleY = out.height / roiH;
+      return parsed.map((z: any) => ({
+        ...z,
+        x1: Math.round((Number(z.x1 ?? z.x ?? 0)) * scaleX),
+        y1: Math.round((Number(z.y1 ?? z.y ?? 0)) * scaleY),
+        x2: Math.round((Number(z.x2 ?? ((z.x ?? 0) + (z.width ?? 0)))) * scaleX),
+        y2: Math.round((Number(z.y2 ?? ((z.y ?? 0) + (z.height ?? 0)))) * scaleY),
+      }));
+    }
+    
+    return parsed;
   } catch {
     return [];
   }
@@ -447,7 +480,146 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024,
     files: 500,
   },
+  fileFilter: (_req, _file, cb) => cb(null, true),
+  // КРИТИЧНО: заставляем busboy/multer читать имена файлов как UTF-8,
+  // а не Latin-1 (по умолчанию). Без этого кириллица в именах файлов
+  // превращается в кракозябры.
+  defParamCharset: "utf8",
 });
+
+// ── Кириллица: исправление кракозябр ─────────────────────────────────────────
+
+function fixDoubleEncodedCyrillic(value: string): string {
+  if (typeof value !== 'string') return value
+  if (!value) return value
+  
+  // Если уже содержит кириллицу — возвращаем как есть
+  if (/[а-яА-ЯёЁ]/.test(value)) return value
+  
+  // Вариант 1: Прямое декодирование из Latin-1 в UTF-8 (работает для типичных кракозябр)
+  try {
+    const latin1Bytes = Buffer.from(value, 'latin1')
+    const decoded = iconv.decode(latin1Bytes, 'utf8')
+    if (decoded && /[а-яА-ЯёЁ]/.test(decoded)) {
+      return decoded
+    }
+  } catch {}
+  
+  // Вариант 2: Двойное декодирование (если кракозябры двойные)
+  try {
+    const latin1Bytes = Buffer.from(value, 'latin1')
+    const decoded1 = iconv.decode(latin1Bytes, 'utf8')
+    if (decoded1 && /[а-яА-ЯёЁ]/.test(decoded1)) {
+      const latin1Bytes2 = Buffer.from(decoded1, 'latin1')
+      const decoded2 = iconv.decode(latin1Bytes2, 'utf8')
+      if (decoded2 && /[а-яА-ЯёЁ]/.test(decoded2)) {
+        return decoded2
+      }
+    }
+  } catch {}
+  
+  // Вариант 3: Windows-1251 → UTF-8
+  try {
+    const decoded = iconv.decode(Buffer.from(value, 'utf8'), 'windows-1251')
+    if (decoded && /[а-яА-ЯёЁ]/.test(decoded)) {
+      return decoded
+    }
+  } catch {}
+  
+  // Если ничего не помогло — возвращаем как есть
+  return value
+}
+
+/** Нормализует ФИО: убирает лишние пробелы, каждое слово с заглавной */
+function normalizePersonName(name: string): string {
+  if (!name) return name
+  
+  // Убираем (*) — маркеры из имени файла
+  name = name.replace(/\s*\([^)]*\)\s*/g, ' ').trim()
+  
+  // Убираем все лишние пробелы (более 1 подряд → 1)
+  let normalized = name.replace(/\s+/g, ' ').trim()
+  
+  // Убираем ведущие/конечные пробелы и спецсимволы
+  normalized = normalized.replace(/^[\s\-_]+|[\s\-_]+$/g, '')
+  
+  // Приводим к формату: каждое слово с заглавной буквы (включая части после дефиса)
+  normalized = normalized.split(' ').map(w => {
+    if (!w) return ''
+    // Если слово полностью цифрами — оставляем как есть
+    if (/^\d+$/.test(w)) return w
+    // Обрабатываем дефис: каждая часть с заглавной
+    if (w.includes('-')) {
+      return w.split('-').map(part => {
+        if (!part) return ''
+        if (/^\d+$/.test(part)) return part
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+      }).join('-')
+    }
+    // Иначе: первая заглавная, остальные строчные
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+  }).join(' ')
+  
+  return normalized
+}
+
+/** Нормализует должность: только 1-е слово с заглавной, все остальные строчные */
+function normalizePositionName(pos: string): string {
+  if (!pos) return pos
+  
+  // Убираем (*) — маркеры из имени файла
+  pos = pos.replace(/\s*\([^)]*\)\s*/g, ' ').trim()
+  
+  // Убираем все лишние пробелы
+  let normalized = pos.replace(/\s+/g, ' ').trim()
+  
+  const words = normalized.split(' ').filter(w => w)
+  if (words.length === 0) return pos
+  
+  // Только первое слово с заглавной, остальные — строчные
+  const result = words.map((w, i) => {
+    if (!w) return ''
+    if (/^\d+$/.test(w)) return w
+    if (i === 0) return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+    return w.toLowerCase()
+  })
+  
+  return result.join(' ')
+}
+
+/** Создаёт ключ для поиска дубликатов (без пробелов, нижний регистр) */
+function getDuplicateKey(name: string): string {
+  if (!name) return ''
+  return name
+    .replace(/\s+/g, '')      // убираем все пробелы
+    .toLowerCase()             // нижний регистр
+}
+
+// Middleware: исправляем кириллицу в body (для JSON-запросов)
+// NOTE: для multipart-запросов body и files заполняются multer ВНУТРИ route handler,
+// поэтому фиксы файлов делаются через fixFilesEncoding() в самих обработчиках.
+app.use((req: express.Request, _res, next) => {
+  if (req.body && typeof req.body === 'object' && !(req.body instanceof Buffer)) {
+    for (const key of Object.keys(req.body)) {
+      const raw = req.body[key]
+      if (typeof raw === 'string') {
+        req.body[key] = fixDoubleEncodedCyrillic(raw)
+      }
+    }
+  }
+  next()
+});
+
+/** Исправляет кириллицу в именах файлов ПОСЛЕ multer */
+function fixFilesEncoding(files: Express.Multer.File[]): void {
+  if (!files || !Array.isArray(files)) return
+  for (const file of files) {
+    if (file && typeof file.originalname === 'string') {
+      file.originalname = fixDoubleEncodedCyrillic(file.originalname)
+    }
+  }
+}
+
 
 // Multer error middleware — перехватывает ошибки multer ДО стандартного error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -549,15 +721,79 @@ app.get(["/api/cameras", "/api/cameras/"], async (req, res) => {
   }
 });
 
-app.get(["/api/cameras/scan/usb", "/api/cameras/scan/usb/"], (req, res) => {
-  // На Windows реальное сканирование требует Native API.
-  // Возвращаем типичные dshow-устройства как подсказку.
-  res.json({
-    cameras: [
-      { index: 0, source: "USB Video Device", name: "USB Video Device (встроенная / первая)" },
-      { index: 1, source: "USB Video Device #2", name: "USB Video Device #2 (вторая)" }
-    ]
-  });
+app.get(["/api/cameras/scan/usb", "/api/cameras/scan/usb/"], async (req, res) => {
+  // Попытка реального сканирования dshow-устройств через ffmpeg
+  try {
+    const ffmpegPath = getFfmpegPath();
+    const proc = spawn(ffmpegPath, [
+      "-hide_banner", "-loglevel", "quiet",
+      "-f", "dshow",
+      "-list_devices", "true",
+      "-i", "dummy"
+    ]);
+
+    let output = "";
+    proc.stdout.on("data", (d: Buffer) => { output += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { output += d.toString(); });
+
+    await new Promise<void>((resolve) => {
+      proc.on("close", () => resolve());
+      // Таймаут 3 секунды
+      setTimeout(resolve, 3000);
+    });
+
+    // Парсим вывод ffmpeg — ищем строки с "directshow" и именами устройств
+    const devices: Array<{ index: number; source: string; name: string }> = [];
+    const lines = output.split("\n");
+    let inDirectShow = false;
+
+    for (const line of lines) {
+      if (line.toLowerCase().includes("directshow")) {
+        inDirectShow = true;
+        continue;
+      }
+      if (inDirectShow && line.trim().startsWith("video=")) {
+        const name = line.replace("video=", "").trim();
+        if (name && name !== "dummy") {
+          devices.push({
+            index: devices.length,
+            source: name,
+            name: name,
+          });
+        }
+      }
+      // Конец блока устройств
+      if (inDirectShow && line.trim() === "" && devices.length > 0) {
+        break;
+      }
+    }
+
+    if (devices.length > 0) {
+      logInfo(`Найдено ${devices.length} dshow устройств`, { devices: devices.map(d => d.name) });
+      res.json({ cameras: devices, scanned: true });
+    } else {
+      // Fallback — типичные имена
+      logWarn("Не удалось автоматически обнаружить dshow устройства, показываем подсказки");
+      res.json({
+        cameras: [
+          { index: 0, source: "USB Video Device", name: "USB Video Device (встроенная / первая)" },
+          { index: 1, source: "USB Video Device #2", name: "USB Video Device #2 (вторая)" }
+        ],
+        scanned: false,
+        hint: "USB-камеры не обнаружены. Проверьте подключение. Показаны типичные имена."
+      });
+    }
+  } catch (err) {
+    logWarn(`Не удалось просканировать USB-устройства: ${(err as Error).message}`);
+    res.json({
+      cameras: [
+        { index: 0, source: "USB Video Device", name: "USB Video Device (встроенная / первая)" },
+        { index: 1, source: "USB Video Device #2", name: "USB Video Device #2 (вторая)" }
+      ],
+      scanned: false,
+      hint: "Ошибка сканирования: " + (err as Error).message
+    });
+  }
 });
 
 app.get(["/api/cameras/scan/onvif", "/api/cameras/scan/onvif/"], (req, res) => {
@@ -579,7 +815,22 @@ app.post(["/api/cameras/:id/start", "/api/cameras/:id/start/"], async (req, res)
     });
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) { cameras[index].is_active = true; cameras[index].status = "online"; }
-    res.json({ success: true, status: "online", camera: sanitizeCamera(updated) });
+
+    // Проверяем источник камеры на типичные проблемы
+    const sourceHint = getCameraSourceHint(updated);
+    const warnings: string[] = [];
+    if (sourceHint) warnings.push(sourceHint);
+    if (!updated.source || !updated.source.trim()) warnings.push("Источник не указан — камера не будет работать");
+    if (updated.camera_type === "USB" && !updated.source?.includes("USB Video")) {
+      warnings.push("Для USB-камер на Windows используйте имя: 'USB Video Device'");
+    }
+
+    res.json({
+      success: true,
+      status: "online",
+      camera: sanitizeCamera(updated),
+      warnings: warnings.length > 0 ? warnings : undefined,
+    });
   } catch (err) {
     res.status(404).json({ detail: "Camera not found" });
   }
@@ -718,30 +969,49 @@ app.post(["/api/recordings/start/:id", "/api/recordings/start/:id/"], async (req
 
 app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
   try {
+    const body = req.body || {};
+    
+    // Валидация источника
+    const source = body.source || "0";
+    const camType = body.camera_type || "USB";
+    const warnings: string[] = [];
+    
+    if (camType === "USB") {
+      if (/^\/dev\/video/.test(source)) {
+        warnings.push(`Путь ${source} — Linux-формат. На Windows используйте: "USB Video Device"`);
+      }
+      if (!source || source === "0") {
+        warnings.push("Источник '0' — заглушка. Укажите реальное устройство.");
+      }
+    }
+
     const newCam = await prisma.camera.create({
       data: {
-        name: req.body.name || "Новая камера",
-        source: req.body.source || "0",
-        camera_type: req.body.camera_type || "USB",
-        zone: req.body.zone || "Основная зона",
-        is_active: req.body.is_active !== false,
+        name: body.name || "Новая камера",
+        source: source,
+        camera_type: camType,
+        zone: body.zone || "Основная зона",
+        is_active: body.is_active !== false,
         status: "online",
-        roi_zones: req.body.roi_zones || null,
+        roi_zones: body.roi_zones || null,
         fps: 25,
         ping_ms: 0,
-        is_smart_recording: req.body.is_smart_recording || false,
-        is_chronicle: req.body.is_chronicle !== false,
-        driver_type: req.body.driver_type || null,
-        ip_address: req.body.ip_address || null,
-        ip_port: req.body.ip_port ? parseInt(req.body.ip_port) : null,
-        username: req.body.username || null,
-        password: req.body.password || null,
-        use_camera_analytics: req.body.use_camera_analytics || false,
+        is_smart_recording: body.is_smart_recording || false,
+        is_chronicle: body.is_chronicle !== false,
+        driver_type: body.driver_type || null,
+        ip_address: body.ip_address || null,
+        ip_port: body.ip_port ? parseInt(body.ip_port) : null,
+        username: body.username || null,
+        password: body.password || null,
+        use_camera_analytics: body.use_camera_analytics || false,
       },
     });
     // Sync in-memory
     cameras.push({ ...newCam });
-    res.status(201).json(sanitizeCamera(newCam));
+    
+    const resp: any = sanitizeCamera(newCam);
+    if (warnings.length > 0) resp.warnings = warnings;
+    res.status(201).json(resp);
   } catch (err) {
     logError(err as Error, { path: "/api/cameras", method: "POST" });
     res.status(500).json({ detail: "Internal server error" });
@@ -755,7 +1025,9 @@ app.put("/api/cameras/:id", async (req, res) => {
       "name", "source", "camera_type", "zone", "is_active", "status",
       "roi_zones", "fps", "ping_ms", "is_smart_recording", "is_chronicle",
       "driver_type", "ip_address", "ip_port", "username", "password",
-      "use_camera_analytics", "snapshot_path"
+      "use_camera_analytics", "snapshot_path",
+      "stream_width", "stream_height", "stream_codec", "stream_fps",
+      "roi_width", "roi_height"
     ];
     const updateData: any = {};
     for (const key of allowedFields) {
@@ -763,13 +1035,29 @@ app.put("/api/cameras/:id", async (req, res) => {
         updateData[key] = req.body[key];
       }
     }
+
+    // Валидация при изменении source
+    const currentCam = cameras.find(c => c.id === id);
+    const warnings: string[] = [];
+    const newSource = updateData.source || currentCam?.source;
+    const newType = updateData.camera_type || currentCam?.camera_type;
+    
+    if (newType === "USB" && currentCam && newSource !== currentCam.source) {
+      if (/^\/dev\/video/.test(newSource)) {
+        warnings.push(`Путь ${newSource} — Linux-формат. На Windows используйте: "USB Video Device"`);
+      }
+    }
+
     const updated = await prisma.camera.update({
       where: { id },
       data: updateData,
     });
     const index = cameras.findIndex((c) => c.id === id);
     if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
-    res.json(sanitizeCamera(updated));
+    
+    const resp: any = sanitizeCamera(updated);
+    if (warnings.length > 0) resp.warnings = warnings;
+    res.json(resp);
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "PUT" });
     res.status(404).json({ detail: "Camera not found" });
@@ -803,10 +1091,18 @@ app.get("/api/cameras/:id/roi", async (req, res) => {
 app.put("/api/cameras/:id/roi", async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const { zones } = req.body;
+    const { zones, width, height } = req.body;
+    const cam = cameras.find(c => c.id === id);
+    // Сохраняем разрешение, при котором нарисованы зоны (текущее разрешение потока)
+    const roiW = width || cam?.stream_width || 1920;
+    const roiH = height || cam?.stream_height || 1080;
     const updated = await prisma.camera.update({
       where: { id },
-      data: { roi_zones: JSON.stringify(zones) },
+      data: { 
+        roi_zones: JSON.stringify(zones),
+        roi_width: roiW,
+        roi_height: roiH,
+      },
     });
     // Sync in-memory
     const index = cameras.findIndex((c) => c.id === id);
@@ -827,6 +1123,43 @@ app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "DELETE" });
     res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
+// Автоопределение параметров потока камеры (разрешение, кодек, FPS)
+app.post(["/api/cameras/:id/probe", "/api/cameras/:id/probe/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const cam = cameras.find(c => c.id === id);
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+
+    // Сбрасываем кэш, чтобы форсировать новый проб
+    streamProbeCache.delete(id);
+    // Очищаем сохранённые данные, чтобы probeStreamParams сделал реальный проб
+    cam.stream_width = null;
+    cam.stream_height = null;
+    cam.stream_codec = null;
+    cam.stream_fps = null;
+    await prisma.camera.update({
+      where: { id },
+      data: { stream_width: null, stream_height: null, stream_codec: null, stream_fps: null }
+    });
+
+    const probed = await probeStreamParams(cam);
+    if (!probed) {
+      return res.json({ success: false, detail: "Не удалось определить параметры потока. Проверьте, что камера доступна." });
+    }
+
+    res.json({
+      success: true,
+      width: probed.width,
+      height: probed.height,
+      codec: probed.codec,
+      fps: probed.fps,
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/probe" });
+    res.status(500).json({ detail: "Internal server error" });
   }
 });
 
@@ -1037,7 +1370,7 @@ app.get(["/api/persons", "/api/persons/"], async (req, res) => {
       }
     }
 
-    const personsFromDB = await prisma.person.findMany({
+const personsFromDB = await prisma.person.findMany({
       where,
       include: { photos: true },
       orderBy: { [sort_by]: sort_dir }
@@ -1130,28 +1463,54 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
     if (req.file) files.push(req.file);
     if (req.files && Array.isArray(req.files)) files = files.concat(req.files as Express.Multer.File[]);
 
-    let name = req.body.name || "Новый посетитель";
-    let position = req.body.position || null;
+    // Исправляем кириллицу в именах файлов и body ПОСЛЕ multer
+    fixFilesEncoding(files);
+    if (req.body && typeof req.body === 'object') {
+      for (const key of Object.keys(req.body)) {
+        if (typeof req.body[key] === 'string') {
+          req.body[key] = fixDoubleEncodedCyrillic(req.body[key])
+        }
+      }
+    }
+
+    let name = normalizePersonName(req.body.name || "Новый посетитель");
+    let position = req.body.position ? normalizePositionName(req.body.position) : null;
 
     if (files.length > 0 && (!req.body.name || req.body.name === "Новый посетитель" || req.body.name === "Новый человек")) {
       const originalName = files[0].originalname;
       const ext = path.extname(originalName);
       const baseName = path.basename(originalName, ext).trim();
       const normalized = baseName.replace(/_/g, ' ').replace(/\s+/g, ' ');
-      const words = normalized.split(' ');
+      const words = normalized.split(' ').filter(w => w); // Убираем пустые
 
       if (words.length >= 4) {
-        name = words.slice(0, 3).join(' ');
-        position = words.slice(3).join(' ');
-      } else if (words.length === 3) {
-        name = words.slice(0, 2).join(' ');
-        position = words[2];
+        // 4+ слов: первые 3 = ФИО, остальное = должность
+        name = normalizePersonName(words.slice(0, 3).join(' '));
+        position = normalizePositionName(words.slice(3).join(' '));
       } else {
-        name = normalized;
+        // 1-3 слов: всё — это ФИО (Фамилия Имя Отчество)
+        name = normalizePersonName(normalized);
       }
     }
 
-    const category = req.body.category || "CLIENT";
+    // Проверяем дубликат по нормализованному ключу
+    const dupKey = getDuplicateKey(name);
+    const category = (req.body.category || "CLIENT").toUpperCase();
+    const existingPersons = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, category: true }
+    });
+    
+    const existingMatch = existingPersons.find(p => getDuplicateKey(p.name) === dupKey);
+    if (existingMatch) {
+      return res.status(409).json({
+        detail: "Дубликат",
+        person_id: existingMatch.id,
+        person_name: existingMatch.name,
+        message: `Уже существует: "${existingMatch.name}"`
+      });
+    }
+
     const photosList = [];
     let embedding_count = 0;
 
@@ -1229,7 +1588,20 @@ app.put("/api/persons/:id", async (req, res) => {
     const updateData: any = {};
     for (const key of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-        updateData[key] = req.body[key];
+        const val = req.body[key];
+        if (typeof val === 'string') {
+          if (key === "name") {
+            updateData[key] = normalizePersonName(val);
+          } else if (key === "position") {
+            updateData[key] = normalizePositionName(val);
+          } else if (key === "comment" || key === "address" || key === "organization" || key === "extra_info") {
+            updateData[key] = val; // уже исправлено в middleware
+          } else {
+            updateData[key] = val;
+          }
+        } else {
+          updateData[key] = val;
+        }
       }
     }
     const updatedPerson = await prisma.person.update({
@@ -1341,6 +1713,16 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
       }
       throw multerErr;
     }
+
+    // Исправляем кириллицу в именах файлов и body ПОСЛЕ multer
+    fixFilesEncoding(files);
+    if (req.body && typeof req.body === 'object') {
+      for (const key of Object.keys(req.body)) {
+        if (typeof req.body[key] === 'string') {
+          req.body[key] = fixDoubleEncodedCyrillic(req.body[key])
+        }
+      }
+    }
   } catch (err: any) {
     // Финальная обработка ошибок
     if (err.code === 'LIMIT_FILE_COUNT') {
@@ -1368,7 +1750,13 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
   setTimeout(async () => {
     const job = importJobs[jobId];
     if (!job) return;
-    job.status = 'processing';
+job.status = 'processing';
+
+    // Единый запрос к БД для всех файлов (N+1 → 1)
+    const existingAll = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, position: true, photos: true }
+    });
 
     for (let index = 0; index < files.length; index++) {
       const f = files[index];
@@ -1379,42 +1767,33 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
 
         let rawName = baseName;
         let rawPosition: string | null = null;
-        if (baseName.includes('-')) {
-          const parts = baseName.split('-');
-          rawName = parts[0].trim();
-          rawPosition = parts.slice(1).join('-').trim();
+        // Разделитель имени и должности — последний дефис в имени файла.
+        // "Иванов-Петров Иван-Директор" → name="Иванов-Петров Иван", position="Директор"
+        const lastDashIdx = baseName.lastIndexOf('-');
+        if (lastDashIdx > 0) {
+          rawName = baseName.substring(0, lastDashIdx).trim();
+          rawPosition = baseName.substring(lastDashIdx + 1).trim();
         }
 
         const formattedName = rawName.replace(/_/g, ' ').trim();
-        let name = formattedName || "Новый посетитель";
-        if (name === name.toUpperCase() || name === name.toLowerCase()) {
-          name = name.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-        }
-        const cleanName = name.replace(/\s+\d+$/, '').replace(/\s*\(\d+\)$/, '').trim();
-
+        let name = normalizePersonName(formattedName) || "Новый посетитель";
+        
         let position: string | null = null;
         if (rawPosition) {
-          position = rawPosition.replace(/_/g, ' ').trim();
-          if (position === position.toUpperCase() || position === position.toLowerCase()) {
-            position = position.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-          }
+          position = normalizePositionName(rawPosition.replace(/_/g, ' ').trim());
         }
 
         const photo_path = `photos/${f.filename}`;
         const fullPath = path.join(publicDir, photo_path);
 
-        // Ищем существующую персону в БД (case-insensitive для SQLite)
-        const existingPersons = await prisma.person.findMany({
-          where: { name: { equals: cleanName } },
-          include: { photos: true },
-          take: 1,
-        });
-        const existingPerson = existingPersons[0] || null;
+        // Ищем существующую персону в кэше (по нормализованному ключу)
+        const dupKey = getDuplicateKey(name);
+        const existingPerson = existingAll.find(p => getDuplicateKey(p.name) === dupKey) || null;
 
         let personId: number;
         if (existingPerson) {
           personId = existingPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(personId, name, category, photo_path, fullPath);
           const isPrimary = existingPerson.photos.length === 0;
           await prisma.personPhoto.create({
             data: { person_id: personId, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
@@ -1425,13 +1804,13 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
           if (isPrimary) {
             await prisma.person.update({ where: { id: personId }, data: { photo_path } });
           }
-          job.created.push({ name: cleanName, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          job.created.push({ name, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
         } else {
           const newPerson = await prisma.person.create({
-            data: { name: cleanName, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
+            data: { name, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
           });
           personId = newPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(personId, name, category, photo_path, fullPath);
           await prisma.personPhoto.create({
             data: { person_id: personId, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
           });
@@ -1439,16 +1818,34 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], async (req, 
             where: { id: personId },
             data: { photo_path, embedding_count: regResult.hasEmbedding ? 1 : 0 },
           });
-          // Sync in-memory
+          // Sync in-memory + обновляем кэш существующих персон,
+          // чтобы последующие файлы того же человека нашли его в existingAll
           const created = await prisma.person.findUnique({ where: { id: personId }, include: { photos: true } });
-          if (created) persons.unshift({ ...created });
-          job.created.push({ name: cleanName, position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          if (created) {
+            persons.unshift({ ...created });
+            existingAll.push(created);
+          }
+          job.created.push({ name, position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
         }
       } catch (err: any) {
         job.failed.push({ file: f.originalname, error: err.message || 'Ошибка обработки' });
       }
       job.progress = index + 1;
     }
+
+    // Агрегируем created по имени персоны (несколько фото → одна строка)
+    const aggregated: Record<string, { name: string; position: string | null; embeddings: number; photos: number; photos_without_embedding: number }> = {};
+    for (const c of job.created) {
+      const key = `${c.name}__${c.position ?? ''}`;
+      if (!aggregated[key]) {
+        aggregated[key] = { name: c.name, position: c.position ?? null, embeddings: 0, photos: 0, photos_without_embedding: 0 };
+      }
+      aggregated[key].embeddings += c.embeddings;
+      aggregated[key].photos += c.photos;
+      aggregated[key].photos_without_embedding += c.photos_without_embedding;
+    }
+    job.created = Object.values(aggregated);
+
     job.status = 'done';
   }, 100);
 
@@ -2145,6 +2542,95 @@ app.get(["/api/recordings", "/api/recordings/"], async (req, res) => {
   }
 });
 
+// ── DIAGNOSTICS API ─────────────────────────────────────────────────────────
+// Диагностика для оперативного выявления проблем
+
+app.get("/api/diagnose", async (req, res) => {
+  const issues: Array<{ severity: "error" | "warning" | "info"; message: string; detail?: string }> = [];
+  const info: Record<string, any> = {};
+
+  // 1. Python-сервер
+  const pythonUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
+    const resp = await fetch(`${pythonUrl}/health`, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (resp.ok) {
+      const data = await resp.json();
+      info.python_server = { url: pythonUrl, healthy: true, initialized: data?.initialized };
+    } else {
+      issues.push({ severity: "error", message: "Python-сервер не отвечает корректно", detail: `HTTP ${resp.status}` });
+      info.python_server = { url: pythonUrl, healthy: false, status: resp.status };
+    }
+  } catch (e) {
+    issues.push({ severity: "error", message: "Python-сервер недоступен", detail: (e as Error).message });
+    info.python_server = { url: pythonUrl, healthy: false, error: (e as Error).message };
+  }
+
+  // 2. FFmpeg
+  try {
+    const ffmpegPath = getFfmpegPath();
+    const proc = spawn(ffmpegPath, ["-version"]);
+    let version = "";
+    proc.stdout.on("data", (d: Buffer) => { version = d.toString().split("\n")[0]; });
+    await new Promise<void>((resolve) => {
+      proc.on("close", () => resolve());
+      setTimeout(resolve, 2000);
+    });
+    info.ffmpeg = { path: ffmpegPath, available: true, version: version.slice(0, 80) };
+  } catch {
+    issues.push({ severity: "warning", message: "FFmpeg не найден в expected путях" });
+    info.ffmpeg = { available: false };
+  }
+
+  // 3. Камеры
+  const dbCameras = await prisma.camera.findMany({ select: { id: true, name: true, source: true, camera_type: true, is_active: true } });
+  info.cameras = dbCameras.map(c => ({
+    ...c,
+    source_hint: getCameraSourceHint(c),
+  }));
+
+  for (const cam of dbCameras) {
+    if (cam.camera_type === "USB" && getCameraSourceHint(cam)) {
+      issues.push({
+        severity: "warning",
+        message: `Камера "${cam.name}" (${cam.id}): некорректный путь на Windows`,
+        detail: getCameraSourceHint(cam) || "",
+      });
+    }
+  }
+
+  // 4. Персоны
+  const personCount = await prisma.person.count();
+  const descriptorCount = await prisma.faceDescriptor.count();
+  info.persons = { total: personCount, descriptors: descriptorCount };
+  if (personCount > 0 && descriptorCount === 0) {
+    issues.push({ severity: "warning", message: `Есть ${personCount} персон, но 0 дескрипторов. Распознавание не будет работать.` });
+  }
+
+  // 5. Диск
+  try {
+    const stats = fs.statSync(process.cwd());
+    info.node_env = process.env.NODE_ENV || "not set";
+    info.pid = process.pid;
+  } catch {}
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    issues,
+    info,
+    summary: {
+      errors: issues.filter(i => i.severity === "error").length,
+      warnings: issues.filter(i => i.severity === "warning").length,
+      total_cameras: dbCameras.length,
+      active_cameras: dbCameras.filter(c => c.is_active).length,
+      persons: personCount,
+      descriptors: descriptorCount,
+    },
+  });
+});
+
 // ── HEALTH API (Full spec for Settings page) ──
 app.get("/api/health", async (req, res) => {
   const engineStatus = getEngineStatus();
@@ -2157,9 +2643,8 @@ app.get("/api/health", async (req, res) => {
   let onnx_package = "onnxruntime";
   let setup_recommendation = "Видеокарта не найдена. Система работает в CPU режиме.";
 
-  // Запросим статус у Python-сервера
+  // Запросим статус у Python-сервера (используем native fetch, не node-fetch)
   try {
-    const fetch = (await import('node-fetch')).default;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2000);
     const response = await fetch('http://localhost:8001/status', { signal: controller.signal });
@@ -2191,14 +2676,26 @@ app.get("/api/health", async (req, res) => {
         setup_recommendation = "Python-сервер работает в CPU-режиме";
       }
     }
-  } catch (e) {
+  } catch {
     // Python-сервер не доступен, оставляем значения по умолчанию
+  }
+
+  // Проверяем доступность камер
+  const camStatus: Record<string, any> = {};
+  for (const cam of cameras) {
+    camStatus[String(cam.id)] = {
+      name: cam.name,
+      type: cam.camera_type,
+      active: cam.is_active,
+      status: cam.status,
+      source: cam.source,
+    };
   }
 
   res.json({
     status: "ok",
     version: "2.4.1",
-    cameras: {}, // Будет заполняться динамически
+    cameras: camStatus,
     faiss: {}, // Будет заполняться из БД
     faiss_index_types: {},
     ai_ready: engineStatus.initialized,
@@ -2806,6 +3303,7 @@ function buildFfmpegInputArgs(cam: any): string[] {
       inputSource = idx === 0 ? "USB Video Device" : `USB Video Device #${idx + 1}`;
     }
     const clean = inputSource.replace(/^video=/i, "");
+    // Для Windows dshow: добавляем -list_devices для диагностики
     return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${clean}`];
   }
   // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
@@ -2825,14 +3323,36 @@ function buildFfmpegInputArgs(cam: any): string[] {
   const extraRtspFlags = cam.camera_type === "Hikvision"
     ? ["-fflags", "+nobuffer+discardcorrupt"]
     : [];
+  // Для H.265/HEVC добавляем явный выбор декодера
+  const codecFlags = (cam.stream_codec || "").toLowerCase().includes("hevc") || (cam.stream_codec || "").toLowerCase().includes("h265")
+    ? ["-c:v", "hevc"]
+    : [];
   // -hide_banner + -loglevel error: не засоряем логи баннером версии/конфигурации на каждом (пере)запуске
   return [
     "-hide_banner", "-loglevel", "error",
     "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp",
     ...extraRtspFlags,
+    ...codecFlags,
     "-timeout", "5000000",
     "-i", source,
   ];
+}
+
+/**
+ * Проверяет, является ли путь камеры Linux-путем (/dev/video*) на Windows.
+ * Возвращает подсказку для пользователя, если проблема обнаружена.
+ */
+export function getCameraSourceHint(cam: any): string | null {
+  if (cam.camera_type !== "USB") return null;
+  
+  const source = (cam.source || "").trim();
+  const isLinuxPath = /^\/dev\/video\d+$/.test(source);
+  const isNumeric = /^\d+$/.test(source);
+  
+  if (!isLinuxPath && !isNumeric) return null;
+  
+  // На Windows dshow устройства имеют другие имена
+  return `Камера использует путь ${source}. На Windows dshow требует имя устройства. Используйте: "USB Video Device" или выполните ffmpeg -list_devices true -f dshow -i dummy для списка`;
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -2899,7 +3419,29 @@ async function startFileRecording(cam: any, durationSec?: number): Promise<strin
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const outputPath = path.join(recordingsDir, `cam${cam.id}_${ts}.mp4`);
     const args = [...buildFfmpegInputArgs(cam)];
-    const { width, height } = getStreamResolution(cam);
+  // Автоопределение параметров потока при первом запуске
+  if (!cam.stream_width || !cam.stream_height) {
+    logInfo(`Автоопределение параметров потока камеры ${cam.id} (${cam.name})...`);
+    const probed = await probeStreamParams(cam);
+    if (probed) {
+      cam.stream_width = probed.width;
+      cam.stream_height = probed.height;
+      cam.stream_codec = probed.codec;
+      cam.stream_fps = probed.fps;
+      const idx = cameras.findIndex(c => c.id === cam.id);
+      if (idx >= 0) {
+        cameras[idx].stream_width = probed.width;
+        cameras[idx].stream_height = probed.height;
+        cameras[idx].stream_codec = probed.codec;
+        cameras[idx].stream_fps = probed.fps;
+      }
+    }
+  }
+
+  const { width, height } = getStreamResolution(cam);
+  // FPS захвата: не выше реального FPS потока и не выше 15 (для производительности)
+  const streamFps = cam.stream_fps || cam.fps || 25;
+  const captureFps = Math.min(streamFps, 15);
     args.push("-y");
     if (durationSec) args.push("-t", String(durationSec));
     args.push("-r", "10", "-s", `${width}x${height}`, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-movflags", "+faststart", outputPath);
@@ -3376,7 +3918,18 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[],
   const roiZones = debug ? [] : parseRoiZones(cam);
   const filtered = debug ? faces : filterFacesByRoi(faces, roiZones);
   if (!debug && roiZones.length && filtered.length < faces.length) {
-    logDebug(`ROI filter camera ${cam.id}: ${faces.length} faces → ${filtered.length} inside zones`);
+    const outside = faces.filter(f => {
+      const box = f.box || {};
+      const cx = (box.x || 0) + (box.width || 0) / 2;
+      const cy = (box.y || 0) + (box.height || 0) / 2;
+      return !isPointInRoi(cx, cy, roiZones);
+    });
+    const coords = outside.map(f => {
+      const b = f.box || {};
+      return `(${(b.x||0)+Math.round((b.width||0)/2)},${(b.y||0)+Math.round((b.height||0)/2)})`;
+    }).join(' ');
+    const zoneInfo = roiZones.map(z => `(${z.x1},${z.y1})-(${z.x2},${z.y2})`).join(' ');
+    logDebug(`ROI filter camera ${cam.id}: ${faces.length} faces → ${filtered.length} inside zones | zones: ${zoneInfo} | outside: ${coords}`);
   }
 
   const minThreshold = debug ? 0.05 : Math.max(low_threshold_pct, recognition_threshold_pct) / 100;
@@ -3731,10 +4284,97 @@ function getFallbackFrame(): string {
   return FALLBACK_JPEG;
 }
 
+// Кэш автоопределённых параметров потока: camId → { width, height, codec, fps, probedAt }
+const streamProbeCache = new Map<number, { width: number; height: number; codec: string; fps: number; probedAt: number }>();
+const STREAM_PROBE_TTL_MS = 5 * 60 * 1000; // 5 минут
+
+/**
+ * Пробует RTSP-поток камеры через FFmpeg и определяет реальные параметры:
+ * разрешение, кодек, FPS. Результат кэшируется и сохраняется в БД.
+ */
+async function probeStreamParams(cam: any): Promise<{ width: number; height: number; codec: string; fps: number } | null> {
+  const cached = streamProbeCache.get(cam.id);
+  if (cached && Date.now() - cached.probedAt < STREAM_PROBE_TTL_MS) {
+    return { width: cached.width, height: cached.height, codec: cached.codec, fps: cached.fps };
+  }
+
+  // Используем данные из БД если они есть (сохранённый результат предыдущего проба)
+  if (cam.stream_width && cam.stream_height) {
+    const result = { width: cam.stream_width, height: cam.stream_height, codec: cam.stream_codec || "h264", fps: cam.stream_fps || 25 };
+    streamProbeCache.set(cam.id, { ...result, probedAt: Date.now() });
+    return result;
+  }
+
+  // Пробуем RTSP-поток
+  try {
+    // Для пробы нужен loglevel info (не error), чтобы увидеть параметры потока
+    const probeArgs = buildFfmpegInputArgs(cam).map(a => a === "error" ? "info" : a);
+    const args = [
+      ...probeArgs,
+      "-frames:v", "1",
+      "-f", "null", "-"
+    ];
+    const proc = spawn(getFfmpegPath(), args);
+    let stderr = "";
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch {}
+        resolve(null);
+      }, 10000);
+
+      proc.on("close", () => {
+        clearTimeout(timeout);
+        // Парсим stderr: "Stream #0:0: Video: hevc (Main), yuvj420p(pc, bt709), 2688x1520, 20 fps"
+        // Pixel format может содержать запятые: yuv420p(tv, bt709, progressive)
+        // Поэтому ищем кодек в начале, а разрешение — первое \d+x\d+ после "Video:"
+        const codecMatch = stderr.match(/Video:\s+(\w+)/);
+        const resMatch = stderr.match(/Video:.*?(\d{2,5})x(\d{2,5})(?:,\s+(\d+)\s+fps)?/);
+        if (codecMatch && resMatch) {
+          const codec = codecMatch[1].toLowerCase();
+          const width = parseInt(resMatch[1], 10);
+          const height = parseInt(resMatch[2], 10);
+          const fps = resMatch[3] ? parseInt(resMatch[3], 10) : 25;
+          const result = { width, height, codec, fps };
+          streamProbeCache.set(cam.id, { ...result, probedAt: Date.now() });
+          logInfo(`Probe камеры ${cam.id}: ${codec} ${width}x${height} @ ${fps}fps`);
+          // Сохраняем в БД
+          prisma.camera.update({
+            where: { id: cam.id },
+            data: { stream_width: width, stream_height: height, stream_codec: codec, stream_fps: fps }
+          }).catch(() => {});
+          resolve(result);
+        } else {
+          logWarn(`Probe камеры ${cam.id}: не удалось распарсить вывод FFmpeg. stderr (first 500): ${stderr.substring(0, 500)}`);
+          resolve(null);
+        }
+      });
+      proc.on("error", () => { clearTimeout(timeout); resolve(null); });
+    });
+  } catch {
+    return null;
+  }
+}
+
 function getStreamResolution(cam: any): { width: number; height: number } {
   const isIp = cam.camera_type === "Hikvision" || cam.camera_type === "UNV" || cam.camera_type === "ONVIF" || cam.camera_type === "RTSP" || cam.camera_type === "IP";
   if (!isIp) {
     return { width: 640, height: 480 };
+  }
+  // Приоритет: данные из БД (автоопределённые) → env → default 1920x1080
+  // Но ограничиваем выход FFmpeg до 1920x1080 для производительности (CPU/GPU)
+  const MAX_OUTPUT_DIM = 1920;
+  if (cam.stream_width && cam.stream_height) {
+    const maxDim = Math.max(cam.stream_width, cam.stream_height);
+    if (maxDim <= MAX_OUTPUT_DIM) {
+      return { width: cam.stream_width, height: cam.stream_height };
+    }
+    const scale = MAX_OUTPUT_DIM / maxDim;
+    return { 
+      width: Math.round(cam.stream_width * scale), 
+      height: Math.round(cam.stream_height * scale) 
+    };
   }
   const key = cam.camera_type || "RTSP";
   const w = parseInt(process.env[`${key}_STREAM_WIDTH`] || process.env["STREAM_WIDTH"] || "1920", 10);
@@ -3749,17 +4389,40 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
     return;
   }
 
+  // Автоопределение параметров потока при первом запуске (async, но не блокируем старт)
+  if (!cam.stream_width || !cam.stream_height) {
+    probeStreamParams(cam).then((probed) => {
+      if (probed) {
+        cam.stream_width = probed.width;
+        cam.stream_height = probed.height;
+        cam.stream_codec = probed.codec;
+        cam.stream_fps = probed.fps;
+        const idx = cameras.findIndex(c => c.id === cam.id);
+        if (idx >= 0) {
+          cameras[idx].stream_width = probed.width;
+          cameras[idx].stream_height = probed.height;
+          cameras[idx].stream_codec = probed.codec;
+          cameras[idx].stream_fps = probed.fps;
+        }
+        logInfo(`Камера ${cam.id}: определено ${probed.codec} ${probed.width}x${probed.height} @ ${probed.fps}fps — при следующем рестарте применится`);
+      }
+    }).catch(() => {});
+  }
+
   const { width, height } = getStreamResolution(cam);
+  // FPS захвата: не выше реального FPS потока и не выше 15 (для производительности)
+  const streamFps = cam.stream_fps || cam.fps || 25;
+  const captureFps = Math.min(streamFps, 15);
   const args = [
     ...buildFfmpegInputArgs(cam),
     "-f", "mjpeg",
     "-pix_fmt", "yuvj422p",
     "-q:v", "3",
-    "-r", "10",
+    "-r", String(captureFps),
     "-s", `${width}x${height}`,
     "-"
   ];
-  logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name}) @ ${width}x${height}`, { source: cam.source, path: getFfmpegPath() });
+  logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name}) @ ${width}x${height} ${captureFps}fps${cam.stream_codec ? ` [${cam.stream_codec}]` : ''}`, { source: cam.source, path: getFfmpegPath() });
 
   try {
     const ffmpegPath = getFfmpegPath();
@@ -3806,7 +4469,6 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
             fs.writeFileSync(snapPath, jpeg);
             const idx = cameras.findIndex((c) => c.id === cam.id);
             if (idx >= 0) cameras[idx].snapshot_path = snapName;
-            logInfo(`Автосохранён снимок для ROI-редактора камеры ${cam.id}: ${snapName}`);
           } catch (e) {
             logError(e as Error, { context: `auto-save snapshot camera ${cam.id}` });
           }
@@ -3845,6 +4507,15 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         return;
       }
 
+      // Подсказка при типичных ошибках
+      const sourceHint = getCameraSourceHint(currentCam);
+      if (sourceHint && (cameraFfmpegFailCount.get(cam.id) || 0) === 1) {
+        logWarn(`Камера ${cam.id}: ${sourceHint}`);
+      }
+      if (code === 1 || code === 23) {
+        logWarn(`Камера ${cam.id}: FFmpeg завершился с ошибкой (код ${code}) — проверьте источник "${currentCam.source}"`);
+      }
+
       const attempts = (cameraFfmpegRetries.get(cam.id) || 0) + 1;
       cameraFfmpegRetries.set(cam.id, attempts);
       if (!cameraFfmpegFailCount.has(cam.id)) cameraFfmpegFailCount.set(cam.id, 0);
@@ -3854,7 +4525,19 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}, следующий повтор через ${delay / 1000}с`);
       }
 
-      if (cam.camera_type === "UNV" && (cameraFfmpegFailCount.get(cam.id) || 0) >= 5) {
+      // USB-камеры: после 3 неудач прекращаем попытки (устройство физически отсутствует)
+      const isUsb = currentCam.camera_type === "USB" || /^\d+$/.test((currentCam.source || "").trim()) || (currentCam.source || "").startsWith("video=");
+      if (isUsb && attempts >= 3) {
+        logWarn(`Камера ${cam.id} (${cam.name}): USB-устройство не найдено после ${attempts} попыток, остановка`);
+        prisma.camera.update({ where: { id: cam.id }, data: { is_active: false } }).catch(() => {});
+        const idx = cameras.findIndex(c => c.id === cam.id);
+        if (idx >= 0) cameras[idx].is_active = false;
+        cameraFfmpegRetries.delete(cam.id);
+        cameraFfmpegFailCount.delete(cam.id);
+        return;
+      }
+
+      if (currentCam.camera_type === "UNV" && (cameraFfmpegFailCount.get(cam.id) || 0) >= 5) {
         cameraWebhookFallback.set(cam.id, true);
         cameraRestartTimers.get(cam.id) && clearTimeout(cameraRestartTimers.get(cam.id)!);
         cameraRestartTimers.delete(cam.id);
@@ -3916,7 +4599,17 @@ function startCameraDetection(cam: any, fallbackFrame: string) {
 
   function hasMotion(frameBase64: string): boolean {
     if (!ai_adaptive_frame_skip) return true;
-    const hash = Buffer.from(frameBase64).toString("base64").slice(0, 64);
+    // Хешируем байты из середины и конца кадра (начало всегда одинаковое — JPEG-заголовок)
+    const buf = Buffer.from(frameBase64, "base64");
+    const len = buf.length;
+    if (len < 100) return true;
+    const samples = [
+      buf[Math.floor(len * 0.25)],
+      buf[Math.floor(len * 0.50)],
+      buf[Math.floor(len * 0.75)],
+      buf[len - 1],
+    ].join(",");
+    const hash = `${len}_${samples}`;
     const prev = cameraLastFrameHash.get(cam.id);
     cameraLastFrameHash.set(cam.id, hash);
     if (!prev) return true;

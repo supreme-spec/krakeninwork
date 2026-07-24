@@ -626,6 +626,14 @@ async function getEmbeddingFromServer(
   strict: boolean = false
 ): Promise<{ descriptor: Float32Array | null; quality: any | null; issues: string[]; passed: boolean; error?: string }> {
   try {
+    // Валидация размера: для загруженных фото (портретов) лимит 20 МБ,
+    // для видеокадров в рантайме — 2 МБ (чтобы отсеять битые кадры)
+    // Флаг strict=true означает, что это фото персоны (а не видеокадр)
+    if (!strict && imageBuffer.length > 2_000_000) {
+      logDebug(`Кадр слишком большой (${imageBuffer.length} байт), пропускаем`);
+      return { descriptor: null, quality: null, issues: ["Кадр слишком большой"], passed: false };
+    }
+
     const formData = new FormData();
     // Конвертируем Buffer в Uint8Array для Blob
     const uint8Array = new Uint8Array(imageBuffer);
@@ -639,6 +647,9 @@ async function getEmbeddingFromServer(
     });
 
     if (!response.ok) {
+      if (response.status === 400) {
+        return { descriptor: null, quality: null, issues: ["Невалидный кадр"], passed: false };
+      }
       throw new Error(`Server responded with status: ${response.status}`);
     }
 
@@ -658,7 +669,7 @@ async function getEmbeddingFromServer(
       error: result.error,
     };
   } catch (e) {
-    logError(e as Error, { context: "Получение эмбеддинга с Python-сервера" });
+    logDebug(`Получение эмбеддинга: ${e instanceof Error ? e.message : String(e)}`);
     return { descriptor: null, quality: null, issues: [], passed: false, error: (e as Error).message };
   }
 }
@@ -669,6 +680,9 @@ async function getEmbeddingFromServer(
  */
 async function assessQualityFromServer(imageBuffer: Buffer): Promise<any | null> {
   try {
+    // Валидация размера
+    if (imageBuffer.length > 2_000_000) return null;
+
     const formData = new FormData();
     const uint8Array = new Uint8Array(imageBuffer);
     const blob = new Blob([uint8Array], { type: "image/jpeg" });
@@ -680,13 +694,51 @@ async function assessQualityFromServer(imageBuffer: Buffer): Promise<any | null>
     });
 
     if (!response.ok) {
-      throw new Error(`Server responded with status: ${response.status}`);
+      if (response.status === 400) return null;
+      return null;
     }
 
     return await response.json();
-  } catch (e) {
-    logError(e as Error, { context: "Оценка качества с Python-сервера" });
+  } catch {
     return null;
+  }
+}
+
+/**
+ * Максимальный размер кадра для отправки на Python-сервер (1.5 МБ).
+ * Большие кадры обрезаются до 1280px по максимальной стороне для снижения нагрузки.
+ */
+const MAX_FRAME_SIZE_BYTES = 1_500_000;
+const MAX_FACE_DETECT_DIM = 1280;
+
+/**
+ * Обрезает JPEG-кадр до максимальной стороны MAX_FACE_DETECT_DIM,
+ * чтобы не превышать лимиты Python-сервера и не получать 400.
+ */
+async function maybeDownscaleFrame(imgBuffer: Buffer): Promise<Buffer> {
+  if (imgBuffer.length <= MAX_FRAME_SIZE_BYTES) return imgBuffer;
+
+  try {
+    const meta = await sharp(imgBuffer).metadata();
+    if (!meta.width || !meta.height) return imgBuffer;
+
+    const maxDim = Math.max(meta.width, meta.height);
+    if (maxDim <= MAX_FACE_DETECT_DIM) return imgBuffer;
+
+    const scale = MAX_FACE_DETECT_DIM / maxDim;
+    const w = Math.round(meta.width * scale);
+    const h = Math.round(meta.height * scale);
+
+    const downscaled = await sharp(imgBuffer)
+      .resize(w, h, { fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    logDebug(`Кадр уменьшен ${meta.width}x${meta.height} -> ${w}x${h} (${imgBuffer.length}→${downscaled.length} байт)`);
+    return downscaled;
+  } catch {
+    // Если sharp не справился — возвращаем оригинал
+    return imgBuffer;
   }
 }
 
@@ -694,8 +746,14 @@ async function detectFacesFromServer(
   imgBuffer: Buffer
 ): Promise<DetectedFace[]> {
   try {
+    // Валидация и возможная обрезка кадра
+    const processed = await maybeDownscaleFrame(imgBuffer);
+
+    // Если кадр был уменьшен — нужно масштабировать координаты лиц обратно
+    const scaled = processed.length < imgBuffer.length;
+
     const formData = new FormData();
-    const uint8Array = new Uint8Array(imgBuffer);
+    const uint8Array = new Uint8Array(processed);
     const blob = new Blob([uint8Array], { type: "image/jpeg" });
     formData.append("image", blob as any, "image.jpg");
     formData.append("with_descriptors", "true");
@@ -711,6 +769,14 @@ async function detectFacesFromServer(
         logDebug(`Детекция: кадр пустой или невалиден (400), пропуск`);
         return [];
       }
+      // 500/503 = сервер перегружен или упал — не спамим, но логируем предупреждение
+      if (response.status >= 500) {
+        logWarn(`Python-сервер вернул ${response.status} при детекции`, {
+          url: FACE_SERVER_URL,
+          frameSize: imgBuffer.length,
+        });
+        return [];
+      }
       throw new Error(`Server responded with status: ${response.status}`);
     }
 
@@ -718,13 +784,35 @@ async function detectFacesFromServer(
       faces: Array<{ box: any; score: number; descriptor?: number[] }>;
     };
 
+    // Вычисляем масштаб, если кадр был уменьшен
+    let scaleX = 1, scaleY = 1;
+    if (scaled) {
+      try {
+        const origMeta = await sharp(imgBuffer).metadata();
+        const procMeta = await sharp(processed).metadata();
+        if (origMeta.width && procMeta.width) {
+          scaleX = origMeta.width / procMeta.width;
+          scaleY = (origMeta.height || 1) / (procMeta.height || 1);
+        }
+      } catch {
+        // если sharp не справился — даунскейла не было
+      }
+    }
+
     return result.faces.map((f: any) => ({
-      box: f.box,
+      box: scaleX !== 1 ? {
+        x: Math.round((f.box.x || 0) * scaleX),
+        y: Math.round((f.box.y || 0) * scaleY),
+        width: Math.round((f.box.width || 0) * scaleX),
+        height: Math.round((f.box.height || 0) * scaleY),
+      } : f.box,
       score: f.score,
       descriptor: f.descriptor ? new Float32Array(f.descriptor) : undefined,
     }));
   } catch (e) {
-    logError(e as Error, { context: "Детекция с Python-сервера" });
+    // Не логируем как ошибку — это либо таймаут, либо временная недоступность
+    // health check уже отметит сервер как unhealthy
+    logDebug(`Детекция: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }
@@ -753,7 +841,7 @@ async function recognizeDescriptorOnServer(
     });
 
     if (!response.ok) {
-      logWarn(`Python recognition failed: ${response.status}`);
+      // Не спамим лог — health check уже отметит проблему
       return [];
     }
 
@@ -799,8 +887,7 @@ async function recognizeDescriptorOnServer(
     }
 
     return mapped;
-  } catch (e) {
-    logError(e as Error, { context: "Распознавание дескриптора на Python" });
+  } catch {
     return [];
   }
 }
@@ -822,13 +909,13 @@ export async function syncIndexWithPython(): Promise<void> {
     });
 
     if (!response.ok) {
-      logWarn(`Python index sync failed: ${response.status}`);
+      // Не спамим — дескрипторы уже в БД, индекс обновится позже
     } else {
       const result = await response.json() as { indexed?: number };
       logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
     }
-  } catch (e) {
-    logError(e as Error, { context: "Синхронизация индекса с Python" });
+  } catch {
+    // Python недоступен — дескрипторы уже в БД
   }
 }
 

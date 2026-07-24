@@ -14,15 +14,18 @@ export default defineConfig(() => {
     },
 
     server: {
+      port: 5173,
+      strictPort: true,
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {
-        // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
         ignored: ['**/logs/**', '**/node_modules/**', '**/.git/**', '**/dist/**'],
       },
       proxy: {
         '/api': {
           target: 'http://localhost:3000',
           changeOrigin: true,
+          timeout: 120000,
+          proxyTimeout: 120000,
         },
         '/ws': {
           target: 'ws://localhost:3000',

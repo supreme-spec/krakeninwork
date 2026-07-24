@@ -596,7 +596,7 @@ function PersonPhotosGallery({
   showAll,
   onToggleAll,
 }: {
-  photos: Array<{ id: number; photo_path: string; is_primary: boolean }>
+  photos: Array<{ id: number; photo_path: string; is_primary: boolean; has_embedding?: boolean }>
   showAll: boolean
   onToggleAll: (open: boolean) => void
 }) {
@@ -611,12 +611,22 @@ function PersonPhotosGallery({
         {visible.map(ph => (
           <div
             key={ph.id}
-            className={`${PHOTO_THUMB} rounded-lg overflow-hidden border border-kraken-border relative flex-shrink-0`}
+            className={`${PHOTO_THUMB} rounded-lg overflow-hidden border relative flex-shrink-0 ${
+              ph.has_embedding === false
+                ? 'border-kraken-red/60 opacity-50 grayscale'
+                : 'border-kraken-border'
+            }`}
+            title={ph.has_embedding === false ? 'Эмбеддинг не получен — рекомендуется удалить' : undefined}
           >
             <img src={`${PHOTO_BASE}/${ph.photo_path}`} alt="" className="w-full h-full object-cover" />
             {ph.is_primary && (
               <div className="absolute bottom-0 left-0 right-0 bg-kraken-green/80 text-black text-[8px] text-center font-bold leading-tight py-px">
                 ★
+              </div>
+            )}
+            {ph.has_embedding === false && (
+              <div className="absolute top-0 right-0 bg-kraken-red text-white text-[8px] font-bold leading-none px-1 py-0.5 rounded-bl">
+                ⚠
               </div>
             )}
           </div>
@@ -640,6 +650,12 @@ function PersonPhotosGallery({
         >
           Свернуть
         </button>
+      )}
+      {photos.some(ph => ph.has_embedding === false) && (
+        <div className="mt-2 text-[10px] text-kraken-red/80 flex items-center gap-1">
+          <span>⚠</span>
+          <span>Затемнённые фото — без эмбеддинга. Удалите их для повышения качества распознавания.</span>
+        </div>
       )}
     </>
   )
@@ -2308,7 +2324,15 @@ function BulkImportModal({ onClose, onDone, categories }: {
                     <span className="text-kraken-text font-medium">{r.name}</span>
                     {r.position && <span className="text-kraken-muted">— {r.position}</span>}
                     {r.stage_name && <span className="text-kraken-purple text-[10px] px-1.5 py-0.5 rounded-full bg-kraken-purple/10">🎭 {r.stage_name}</span>}
-                    <span className="text-kraken-disabled ml-auto">{r.embeddings} эмб.</span>
+                    <span className="text-kraken-disabled ml-auto">
+                      {r.embeddings} эмб.
+                      {r.photos > 1 && ` / ${r.photos} фото`}
+                    </span>
+                    {r.photos_without_embedding > 0 && (
+                      <span className="text-kraken-red text-[10px]" title="Фото без эмбеддинга — затемнены в профиле">
+                        ⚠ {r.photos_without_embedding} без эмб.
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>

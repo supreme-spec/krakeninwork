@@ -16,6 +16,15 @@ export const prisma =
         : ["error"],
   });
 
+// Принудительно устанавливаем UTF-8 для SQLite на Windows
+// Без этого Prisma/better-sqlite3 может записать кириллицу как кракозябры
+async function ensureUtf8() {
+  await prisma.$executeRawUnsafe("PRAGMA encoding = 'UTF-8'");
+}
+ensureUtf8().catch(() => {
+  // Если PRAGMA уже установлен или база не готова — игнорируем
+});
+
 if (process.env.NODE_ENV !== "production") {
   global.__prisma = prisma;
 }

@@ -280,7 +280,7 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
     try {
       await apiFetch(`/cameras/${cameraId}/roi`, {
         method: 'PUT',
-        body: JSON.stringify({ zones }),
+        body: JSON.stringify({ zones, width: origW, height: origH }),
       })
       onClose()
     } catch (e: any) {

@@ -72,6 +72,14 @@ export interface Camera {
   use_camera_analytics?: boolean
   brand?: string | null
   model_name?: string | null
+  // Автоопределённые параметры потока
+  stream_width?: number | null
+  stream_height?: number | null
+  stream_codec?: string | null
+  stream_fps?: number | null
+  // ROI drawing resolution
+  roi_width?: number | null
+  roi_height?: number | null
 }
 
 export interface KrakenEvent {
